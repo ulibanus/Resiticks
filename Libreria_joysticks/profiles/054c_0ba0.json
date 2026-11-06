@@ -1,0 +1,103 @@
+{
+  "name": "Sony DualShock 4 USB Wireless Adapter",
+  "vendor": "054c",
+  "product": "0ba0",
+  "mapping": {
+    "lt": {
+      "type": "axis",
+      "code": 2,
+      "direction": 1,
+      "is_trigger": true
+    },
+    "rt": {
+      "type": "axis",
+      "code": 5,
+      "direction": 1,
+      "is_trigger": true
+    },
+    "lb": {
+      "type": "btn",
+      "code": 310
+    },
+    "rb": {
+      "type": "btn",
+      "code": 311
+    },
+    "dpup": {
+      "type": "hat",
+      "code": 17,
+      "value": -1
+    },
+    "dpdown": {
+      "type": "hat",
+      "code": 17,
+      "value": 1
+    },
+    "dpleft": {
+      "type": "hat",
+      "code": 16,
+      "value": -1
+    },
+    "dpright": {
+      "type": "hat",
+      "code": 16,
+      "value": 1
+    },
+    "a": {
+      "type": "btn",
+      "code": 304
+    },
+    "b": {
+      "type": "btn",
+      "code": 305
+    },
+    "x": {
+      "type": "btn",
+      "code": 308
+    },
+    "y": {
+      "type": "btn",
+      "code": 307
+    },
+    "back": {
+      "type": "btn",
+      "code": 314
+    },
+    "start": {
+      "type": "btn",
+      "code": 315
+    },
+    "guide": {
+      "type": "btn",
+      "code": 316
+    },
+    "thumbl": {
+      "type": "btn",
+      "code": 317
+    },
+    "thumbr": {
+      "type": "btn",
+      "code": 318
+    },
+    "leftx": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1
+    },
+    "lefty": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1
+    },
+    "rightx": {
+      "type": "axis",
+      "code": 3,
+      "direction": 1
+    },
+    "righty": {
+      "type": "axis",
+      "code": 4,
+      "direction": 1
+    }
+  }
+}

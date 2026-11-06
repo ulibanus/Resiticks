@@ -1,0 +1,75 @@
+================================================================================
+🎮 LIBRERÍA DE JOYSTICKS — RESITICKS UNIVERSAL (LINUX & WINDOWS)
+================================================================================
+
+Este paquete contiene la solución definitiva para jugar de a 4 u 8 amigos
+con joysticks genéricos, sin botones cruzados, sin doble input y con soporte
+total para Steam, PES 6 y juegos de PC.
+
+--------------------------------------------------------------------------------
+📁 ESTRUCTURA DEL PAQUETE
+--------------------------------------------------------------------------------
+├── 1_Linux/          -> Versión completa nativa para Linux (Steam/Proton/PES)
+│   ├── iniciar_resiticks.sh      (Abre la interfaz gráfica con diagnóstico)
+│   ├── calibrar_nuevo_mando.sh   (Calibrador rápido por consola de PES)
+│   ├── app.py                    (Código fuente interfaz gráfica 8 slots)
+│   ├── calibrate.py              (Calibrador oficial paso a paso)
+│   ├── bridge.py                 (Motor de inyección XInput)
+│   └── virtual_xbox.py           (Controlador nativo /dev/uinput)
+│
+├── 2_Windows/        -> Versión y guía de compatibilidad para Windows
+│   ├── GUIA_WINDOWS.txt          (Diferencias, x360ce, ViGEmBus e HidHide)
+│   ├── instalar_requisitos.bat   (Instala dependencias en Windows)
+│   └── resiticks_windows.py      (Motor XInput con vgamepad)
+│
+└── profiles/         -> La biblioteca con los 15 joysticks ya calibrados
+    ├── 0079_0006.json            (🎮 Joystick Aitor - Microntek)
+    ├── 0e8f_0008.json            (🎮 JOYSTICK GMX Julian G)
+    ├── 20d6_576d.json            (🎮 Joystick Ramiro-Chino - BDA OPP)
+    ├── 057e_2009.json            (🎮 Redragon Fausto - Switch Pro Mode)
+    ├── 045e_028e.json            (🎮 Redragon Mate - Xbox Mode)
+    ├── 054c_0268.json            (🎮 Joystick camuflado Daco - PS3)
+    ├── 054c_05c4.json            (🎮 Sony DualShock 4 V1)
+    ├── 054c_09cc.json            (🎮 Sony DualShock 4 V2)
+    └── 045e_*.json               (🎮 Xbox 360, Xbox One, Series X|S)
+
+--------------------------------------------------------------------------------
+🐧 DIFERENCIAS: LINUX vs. WINDOWS
+--------------------------------------------------------------------------------
+• EN LINUX:
+  El kernel de Linux tiene soporte nativo para crear mandos virtuales ("/dev/uinput")
+  y bloquear mandos genéricos para que no haya doble input ("EVIOCGRAB").
+  No necesita drivers externos. Simplemente corrés "./iniciar_resiticks.sh".
+
+• EN WINDOWS:
+  Windows necesita el driver abierto "ViGEmBus" para emular Xbox 360, y la utilidad
+  "HidHide" de Nefarius para ocultar el mando físico y evitar que el juego reciba
+  dos señales al mismo tiempo (doble input).
+  (Ver detalles paso a paso dentro de la carpeta "2_Windows/GUIA_WINDOWS.txt").
+
+--------------------------------------------------------------------------------
+⚽ REGLA DE ORO EN PES 6 SETTINGS (WINDOWS Y LINUX/PROTON)
+--------------------------------------------------------------------------------
+Tanto en Windows como en Linux, asigná cada jugador así:
+
+  • Player 1: Elegir "Controller (XBOX 360 For Windows)"
+  • Player 2: Elegir "Controller (XBOX 360 For Windows) - 2"
+  • Player 3: Elegir "Controller (XBOX 360 For Windows) - 3"
+  • Player 4: Elegir "Controller (XBOX 360 For Windows) - 4"
+  (Hasta Player 8 si juegan 8 amigos).
+
+⚠️ Si te aparecen nombres como "Microntek" o "Gasia", IGNORALOS.
+Eligiendo los que dicen "Controller (XBOX 360...)" tenés garantizadas las 4
+direcciones de ambas palancas, los amagues y los botones correctos.
+
+--------------------------------------------------------------------------------
+🎯 CÓMO CALIBRAR UN JOYSTICK NUEVO POR CONSOLA
+--------------------------------------------------------------------------------
+En Linux:
+1. Conectá el joystick nuevo.
+2. Abrí una terminal en la carpeta "1_Linux" y ejecutá:
+      ./calibrar_nuevo_mando.sh
+3. Elegí el número del joystick y seguí el orden de PES Settings.
+4. Escribí el nombre de tu amigo (ej: "Joystick de Lucas") y dale ENTER.
+¡Queda guardado en "profiles/" para siempre!
+================================================================================

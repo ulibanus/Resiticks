@@ -1,0 +1,41 @@
+================================================================================
+🎮 RESITICKS PARA WINDOWS — GUÍA DE FUNCIONAMIENTO Y DIFERENCIAS
+================================================================================
+
+¿Por qué en Windows x360ce les dio problemas con 4 joysticks?
+1. Doble Input (Mando Fantasma): Windows ve al mismo tiempo el joystick genérico
+   (DirectInput) y el mando emulado de Xbox 360 (XInput). El juego recibe 2 señales.
+2. Mezcla de Mandos: Si varios joysticks son iguales, Windows confunde los puertos.
+
+--------------------------------------------------------------------------------
+🛠️ CÓMO FUNCIONA EN WINDOWS (SOLUCIÓN DEFINITIVA)
+--------------------------------------------------------------------------------
+En Windows no existe "/dev/uinput" (que es propio de Linux).
+Windows utiliza el estándar de la industria llamado:
+   • ViGEmBus (Virtual Gamepad Emulation Bus de Nefarius)
+   • HidHide (Oculta el mando genérico físico para que no haya doble input)
+
+--------------------------------------------------------------------------------
+🚀 OPCIÓN 1: EJECUTAR RESITICKS EN WINDOWS (CON PYTHON)
+--------------------------------------------------------------------------------
+1. Instalar Python para Windows (marcar la casilla "Add Python to PATH").
+2. Ejecutar el archivo:
+      instalar_requisitos_windows.bat
+   (Instala 'vgamepad' y 'pygame').
+3. Instalar ViGEmBus si no lo tienen (descarga libre oficial de Nefarius:
+   https://github.com/nefarius/ViGEmBus/releases).
+4. Ejecutar:
+      python resiticks_windows.py
+   Resiticks leerá automáticamente todos los perfiles de la carpeta "profiles/"
+   (Aitor, Julián, Ramiro, Fausto, Redragon, etc.) y creará los mandos oficiales
+   de Xbox 360 en Windows.
+
+--------------------------------------------------------------------------------
+🎮 OPCIÓN 2: USAR X360CE CORRECTAMENTE (SIN CONFLICTOS DE 4 MANDOS)
+--------------------------------------------------------------------------------
+Si Aitor prefiere seguir usando x360ce en Windows porque ya lo tiene instalado:
+1. En x360ce, ir a la pestaña "Options" -> "HID Guardian / HidHide".
+2. Tildar la casilla para ocultar los mandos físicos DirectInput.
+3. Asignar los botones siguiendo el orden oficial que usamos en nuestros perfiles
+   (todos los perfiles están en la carpeta "profiles/").
+================================================================================

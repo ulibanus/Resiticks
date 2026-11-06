@@ -1,0 +1,150 @@
+{
+  "name": "Redragon Mate",
+  "hardware_name": "Microsoft X-Box 360 pad",
+  "vendor": "045e",
+  "product": "028e",
+  "mapping": {
+    "lt": {
+      "type": "axis",
+      "code": 2,
+      "direction": 1,
+      "value": 223,
+      "is_trigger": true
+    },
+    "lb": {
+      "type": "btn",
+      "code": 310
+    },
+    "dpup": {
+      "type": "hat",
+      "code": 17,
+      "value": -1
+    },
+    "dpleft": {
+      "type": "hat",
+      "code": 16,
+      "value": -1
+    },
+    "dpdown": {
+      "type": "hat",
+      "code": 17,
+      "value": 1
+    },
+    "dpright": {
+      "type": "hat",
+      "code": 16,
+      "value": 1
+    },
+    "left_up": {
+      "type": "axis",
+      "code": 1,
+      "direction": -1,
+      "value": -19457
+    },
+    "left_left": {
+      "type": "axis",
+      "code": 0,
+      "direction": -1,
+      "value": -20480
+    },
+    "left_down": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1,
+      "value": 20223
+    },
+    "left_right": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1,
+      "value": 16640
+    },
+    "thumbl": {
+      "type": "btn",
+      "code": 317
+    },
+    "back": {
+      "type": "btn",
+      "code": 314
+    },
+    "rt": {
+      "type": "axis",
+      "code": 5,
+      "direction": 1,
+      "value": 137,
+      "is_trigger": true
+    },
+    "rb": {
+      "type": "btn",
+      "code": 311
+    },
+    "y": {
+      "type": "btn",
+      "code": 308
+    },
+    "x": {
+      "type": "btn",
+      "code": 307
+    },
+    "a": {
+      "type": "btn",
+      "code": 304
+    },
+    "b": {
+      "type": "btn",
+      "code": 305
+    },
+    "right_up": {
+      "type": "axis",
+      "code": 4,
+      "direction": -1,
+      "value": -21249
+    },
+    "right_left": {
+      "type": "axis",
+      "code": 3,
+      "direction": -1,
+      "value": -28416
+    },
+    "right_down": {
+      "type": "axis",
+      "code": 4,
+      "direction": 1,
+      "value": 21759
+    },
+    "right_right": {
+      "type": "axis",
+      "code": 3,
+      "direction": 1,
+      "value": 26368
+    },
+    "thumbr": {
+      "type": "btn",
+      "code": 318
+    },
+    "start": {
+      "type": "btn",
+      "code": 315
+    },
+    "leftx": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1
+    },
+    "lefty": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1
+    },
+    "rightx": {
+      "type": "axis",
+      "code": 3,
+      "direction": 1
+    },
+    "righty": {
+      "type": "axis",
+      "code": 4,
+      "direction": 1
+    }
+  }
+}

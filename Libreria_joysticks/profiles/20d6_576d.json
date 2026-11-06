@@ -1,0 +1,144 @@
+{
+  "name": "Joystick Ramiro-Chino",
+  "hardware_name": "BDA OPP",
+  "vendor": "20d6",
+  "product": "576d",
+  "mapping": {
+    "lt": {
+      "type": "btn",
+      "code": 310
+    },
+    "lb": {
+      "type": "btn",
+      "code": 308
+    },
+    "dpup": {
+      "type": "hat",
+      "code": 17,
+      "value": -1
+    },
+    "dpleft": {
+      "type": "hat",
+      "code": 16,
+      "value": -1
+    },
+    "dpdown": {
+      "type": "hat",
+      "code": 17,
+      "value": 1
+    },
+    "dpright": {
+      "type": "hat",
+      "code": 16,
+      "value": 1
+    },
+    "left_up": {
+      "type": "axis",
+      "code": 1,
+      "direction": -1,
+      "value": 69
+    },
+    "left_left": {
+      "type": "axis",
+      "code": 0,
+      "direction": -1,
+      "value": 59
+    },
+    "left_down": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1,
+      "value": 194
+    },
+    "left_right": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1,
+      "value": 191
+    },
+    "thumbl": {
+      "type": "btn",
+      "code": 314
+    },
+    "back": {
+      "type": "btn",
+      "code": 312
+    },
+    "rt": {
+      "type": "btn",
+      "code": 311
+    },
+    "rb": {
+      "type": "btn",
+      "code": 309
+    },
+    "y": {
+      "type": "btn",
+      "code": 307
+    },
+    "x": {
+      "type": "btn",
+      "code": 304
+    },
+    "a": {
+      "type": "btn",
+      "code": 305
+    },
+    "b": {
+      "type": "btn",
+      "code": 306
+    },
+    "right_up": {
+      "type": "axis",
+      "code": 5,
+      "direction": -1,
+      "value": 53
+    },
+    "right_left": {
+      "type": "axis",
+      "code": 2,
+      "direction": -1,
+      "value": 43
+    },
+    "right_down": {
+      "type": "axis",
+      "code": 5,
+      "direction": 1,
+      "value": 194
+    },
+    "right_right": {
+      "type": "axis",
+      "code": 2,
+      "direction": 1,
+      "value": 185
+    },
+    "thumbr": {
+      "type": "btn",
+      "code": 315
+    },
+    "start": {
+      "type": "btn",
+      "code": 313
+    },
+    "leftx": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1
+    },
+    "lefty": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1
+    },
+    "rightx": {
+      "type": "axis",
+      "code": 2,
+      "direction": 1
+    },
+    "righty": {
+      "type": "axis",
+      "code": 5,
+      "direction": 1
+    }
+  }
+}

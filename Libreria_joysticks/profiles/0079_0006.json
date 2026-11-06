@@ -1,0 +1,144 @@
+{
+  "name": "Joystick Aitor",
+  "hardware_name": "Microntek              USB Joystick          ",
+  "vendor": "0079",
+  "product": "0006",
+  "mapping": {
+    "lt": {
+      "type": "btn",
+      "code": 294
+    },
+    "lb": {
+      "type": "btn",
+      "code": 292
+    },
+    "dpup": {
+      "type": "hat",
+      "code": 17,
+      "value": -1
+    },
+    "dpleft": {
+      "type": "hat",
+      "code": 16,
+      "value": -1
+    },
+    "dpdown": {
+      "type": "hat",
+      "code": 17,
+      "value": 1
+    },
+    "dpright": {
+      "type": "hat",
+      "code": 16,
+      "value": 1
+    },
+    "left_up": {
+      "type": "axis",
+      "code": 1,
+      "direction": -1,
+      "value": 0
+    },
+    "left_left": {
+      "type": "axis",
+      "code": 0,
+      "direction": -1,
+      "value": 0
+    },
+    "left_down": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1,
+      "value": 255
+    },
+    "left_right": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1,
+      "value": 255
+    },
+    "thumbl": {
+      "type": "btn",
+      "code": 298
+    },
+    "back": {
+      "type": "btn",
+      "code": 296
+    },
+    "rt": {
+      "type": "btn",
+      "code": 295
+    },
+    "rb": {
+      "type": "btn",
+      "code": 293
+    },
+    "y": {
+      "type": "btn",
+      "code": 288
+    },
+    "x": {
+      "type": "btn",
+      "code": 291
+    },
+    "a": {
+      "type": "btn",
+      "code": 290
+    },
+    "b": {
+      "type": "btn",
+      "code": 289
+    },
+    "right_up": {
+      "type": "axis",
+      "code": 5,
+      "direction": -1,
+      "value": 0
+    },
+    "right_left": {
+      "type": "axis",
+      "code": 2,
+      "direction": -1,
+      "value": 0
+    },
+    "right_down": {
+      "type": "axis",
+      "code": 5,
+      "direction": 1,
+      "value": 255
+    },
+    "right_right": {
+      "type": "axis",
+      "code": 2,
+      "direction": 1,
+      "value": 255
+    },
+    "thumbr": {
+      "type": "btn",
+      "code": 299
+    },
+    "start": {
+      "type": "btn",
+      "code": 297
+    },
+    "leftx": {
+      "type": "axis",
+      "code": 0,
+      "direction": 1
+    },
+    "lefty": {
+      "type": "axis",
+      "code": 1,
+      "direction": 1
+    },
+    "rightx": {
+      "type": "axis",
+      "code": 2,
+      "direction": 1
+    },
+    "righty": {
+      "type": "axis",
+      "code": 5,
+      "direction": 1
+    }
+  }
+}
