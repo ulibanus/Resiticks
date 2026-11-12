@@ -293,3 +293,35 @@ class VirtualXboxPad:
                 os.close(fd)
             except OSError:
                 pass
+
+
+def start_physical_rumble_pulse(phys_fd, duration_ms=280):
+    """Upload and play a short FF_RUMBLE pulse on a physical evdev fd; returns effect id or None."""
+    if phys_fd is None:
+        return None
+    eff = bytearray(48)
+    struct.pack_into("HhHHHHH", eff, 0, FF_RUMBLE, -1, 0, 0, 0, int(duration_ms), 0)
+    struct.pack_into("HH", eff, 16, 0xA000, 0x6000)
+    try:
+        fcntl.ioctl(phys_fd, EVIOCSFF, eff)
+        eff_id = struct.unpack_from("h", eff, 2)[0]
+        if eff_id < 0:
+            return None
+        os.write(phys_fd, struct.pack(EVENT_FORMAT, 0, 0, EV_FF, eff_id, 1))
+        return eff_id
+    except OSError:
+        return None
+
+
+def stop_physical_rumble_pulse(phys_fd, eff_id):
+    """Stop and erase a previously uploaded physical FF_RUMBLE test effect."""
+    if phys_fd is None or eff_id is None:
+        return
+    try:
+        os.write(phys_fd, struct.pack(EVENT_FORMAT, 0, 0, EV_FF, eff_id, 0))
+    except OSError:
+        pass
+    try:
+        fcntl.ioctl(phys_fd, EVIOCRMFF, eff_id)
+    except OSError:
+        pass

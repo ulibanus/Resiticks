@@ -156,10 +156,30 @@ def normalize_profile_data(data, filepath=None):
     data.setdefault("deadzone_left", 0.05)
     data.setdefault("deadzone_right", 0.05)
     data.setdefault("rumble_enabled", True)
+    data.setdefault("outer_scale", 1.0)
+    data.setdefault("sensitivity_curve", "linear")
+    data.setdefault("nintendo_swap", False)
+    data.setdefault("trigger_bumper_swap", False)
     data.setdefault("center_offset", {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0})
     if filepath:
         data["_file"] = filepath
     return data
+
+
+def apply_stick_curve(adj, deadzone=0.05, outer_scale=1.0, curve="linear"):
+    """Apply radial deadzone, outer diagonal reach compensation, and response curve."""
+    mag = abs(adj)
+    dz = max(0.0, min(0.45, float(deadzone)))
+    if mag < dz:
+        return 0.0
+    norm = (mag - dz) / max(0.01, 1.0 - dz)
+    scale = max(1.0, min(1.5, float(outer_scale)))
+    norm = min(1.0, norm * scale)
+    if curve == "precise":
+        norm = norm ** 1.45
+    elif curve == "aggressive":
+        norm = norm ** 0.72
+    return norm * (1.0 if adj > 0 else -1.0)
 
 
 def _compute_profiles_dir_sig(pdir):

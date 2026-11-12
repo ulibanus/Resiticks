@@ -13,6 +13,7 @@ import io
 import json
 import os
 import re
+import secrets
 import select
 import shutil
 import signal
@@ -40,6 +41,7 @@ from evdev_utils import (
     EVIOCGRAB,
     EVENT_FORMAT,
     EVENT_SIZE,
+    apply_stick_curve,
     delete_profile,
     detect_terminal_cmd,
     diagnose_system,
@@ -80,6 +82,8 @@ from virtual_xbox import (
     EV_SYN,
     SYN_REPORT,
     VirtualXboxPad,
+    start_physical_rumble_pulse,
+    stop_physical_rumble_pulse,
 )
 from web_ui import HTML_PAGE
 
@@ -97,8 +101,11 @@ class ResiticksState:
     def __init__(self):
         cfg = load_config()
         self.lock = threading.Lock()
+        self.ui_cond = threading.Condition()
+        self.ui_seq = 0
         self.supervisor_wakeup = threading.Event()
         self.shutdown_event = threading.Event()
+        self.lan_token = None
         self.bridge_enabled = bool(cfg.get("bridge_enabled", True))
         self.slot_pins = dict(cfg.get("slot_pins", {}))
         self.slot_overrides = {}  # identifier -> forced slot 1..8
@@ -110,6 +117,12 @@ class ResiticksState:
         self.workers = {}  # identifier -> GamepadWorker
         self.profile_revision = 0
         self.cal_launch_proc = None
+
+    def notify_ui(self):
+        """Wake any active SSE dashboard clients immediately on state or input updates."""
+        with self.ui_cond:
+            self.ui_seq += 1
+            self.ui_cond.notify_all()
 
 
 state = ResiticksState()
@@ -373,8 +386,15 @@ class GamepadWorker(threading.Thread):
         self.dpad_state = {"x": 0, "y": 0}
         self.deadzone_left = 0.05
         self.deadzone_right = 0.05
+        self.outer_scale = 1.0
+        self.sensitivity_curve = "linear"
+        self.nintendo_swap = False
+        self.trigger_bumper_swap = False
         self.center_offset = {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0}
         self.rumble_enabled = True
+        self._rumble_test_req = threading.Event()
+        self._rumble_test_stop_at = 0.0
+        self._test_ff_id = None
         self.profile = copy.deepcopy(profile)
         self._compile_profile(self.profile)
 
@@ -402,6 +422,16 @@ class GamepadWorker(threading.Thread):
         axis_dpad_map = {}
         mapping = profile.get("mapping", {})
 
+        nintendo_swap = bool(profile.get("nintendo_swap", False))
+        trigger_bumper_swap = bool(profile.get("trigger_bumper_swap", False))
+
+        def _remap_target(tgt):
+            if nintendo_swap:
+                tgt = {"a": "b", "b": "a", "x": "y", "y": "x"}.get(tgt, tgt)
+            if trigger_bumper_swap:
+                tgt = {"lt": "lb", "lb": "lt", "rt": "rb", "rb": "rt"}.get(tgt, tgt)
+            return tgt
+
         for target, data in mapping.items():
             if not isinstance(data, dict):
                 continue
@@ -409,18 +439,20 @@ class GamepadWorker(threading.Thread):
             code = data.get("code")
             if code is None:
                 continue
+            eff_target = _remap_target(target)
             if t_type == "btn":
-                btn_map[code] = target
+                btn_map[code] = eff_target
             elif t_type == "hat":
-                hat_map[(code, data.get("value"))] = target
-            elif t_type == "axis" and target in ("dpup", "dpdown", "dpleft", "dpright"):
-                axis_dpad_map.setdefault(code, []).append((target, data.get("direction", 1)))
+                hat_map[(code, data.get("value"))] = eff_target
+            elif t_type == "axis" and eff_target in ("dpup", "dpdown", "dpleft", "dpright"):
+                axis_dpad_map.setdefault(code, []).append((eff_target, data.get("direction", 1)))
 
         canonical_axes = ("leftx", "lefty", "rightx", "righty", "lt", "rt")
         for target in canonical_axes:
             data = mapping.get(target)
             if isinstance(data, dict) and data.get("type") == "axis":
-                axis_map[data.get("code")] = (target, data.get("direction", 1))
+                eff_target = _remap_target(target)
+                axis_map[data.get("code")] = (eff_target, data.get("direction", 1))
 
         # Safe fallback for legacy profiles lacking canonical keys
         legacy = [
@@ -443,6 +475,10 @@ class GamepadWorker(threading.Thread):
             self.axis_dpad_map = axis_dpad_map
             self.deadzone_left = float(profile.get("deadzone_left", 0.05))
             self.deadzone_right = float(profile.get("deadzone_right", 0.05))
+            self.outer_scale = max(1.0, min(1.5, float(profile.get("outer_scale", 1.0))))
+            self.sensitivity_curve = str(profile.get("sensitivity_curve", "linear"))
+            self.nintendo_swap = nintendo_swap
+            self.trigger_bumper_swap = trigger_bumper_swap
             co = profile.get("center_offset") or {}
             self.center_offset = {
                 "lx": float(co.get("lx", 0.0)),
@@ -453,7 +489,7 @@ class GamepadWorker(threading.Thread):
             self.rumble_enabled = bool(profile.get("rumble_enabled", True))
 
     def hot_reload_profile(self, profile):
-        """Apply updated deadzones, center offsets, or mappings in-place if device active."""
+        """Apply updated deadzones, curves, swaps, or mappings in-place if device active."""
         self._compile_profile(profile)
         with state.lock:
             slot_info = state.active_slots.get(self.player_num)
@@ -461,7 +497,19 @@ class GamepadWorker(threading.Thread):
                 slot_info["name"] = self.profile.get("name")
                 slot_info["deadzone_left"] = self.deadzone_left
                 slot_info["deadzone_right"] = self.deadzone_right
+                slot_info["outer_scale"] = self.outer_scale
+                slot_info["sensitivity_curve"] = self.sensitivity_curve
+                slot_info["nintendo_swap"] = self.nintendo_swap
+                slot_info["trigger_bumper_swap"] = self.trigger_bumper_swap
                 slot_info["rumble_enabled"] = self.rumble_enabled
+        state.notify_ui()
+
+    def trigger_test_rumble(self):
+        """Schedule a non-blocking physical rumble test pulse on this worker."""
+        self._rumble_test_req.set()
+        if self.phys_ff:
+            return True, "Pulso de vibración enviado al mando físico."
+        return False, "El mando físico no reporta soporte EV_FF de vibración."
 
     def _open_physical_device(self, dev_path):
         """Open evdev device (preferring RW for rumble) and apply EVIOCGRAB if bridge_mode."""
@@ -555,7 +603,7 @@ class GamepadWorker(threading.Thread):
             self.vpad.emit_key(xbox_btn, is_pressed)
 
     def _handle_abs_event(self, code, value):
-        """Translate D-Pad hats, axis D-Pads, triggers, and deadzone-compensated sticks."""
+        """Translate D-Pad hats, axis D-Pads, triggers, and deadzone/curve-compensated sticks."""
         with self._cfg_lock:
             hat_target = self.hat_map.get((code, value))
             hat_alt_pos = self.hat_map.get((code, 1)) or self.hat_map.get((code, -1))
@@ -563,6 +611,8 @@ class GamepadWorker(threading.Thread):
             axis_spec = self.axis_map.get(code)
             dz_l = self.deadzone_left
             dz_r = self.deadzone_right
+            outer_scale = self.outer_scale
+            curve = self.sensitivity_curve
             offsets = self.center_offset
 
         if hat_target or (hat_alt_pos and value == 0) or code in (ABS_HAT0X, ABS_HAT0Y):
@@ -611,15 +661,22 @@ class GamepadWorker(threading.Thread):
         info = self.abs_info.get(code, {"min": 0, "max": 255})
         val_min, val_max = info["min"], info["max"]
 
-        if target in ("lt", "rt"):
+        if target in ("lt", "rt", "lb", "rb"):
             span = max(1, val_max - val_min)
             trig_norm = max(0.0, min(1.0, (value - val_min) / span))
             trig_val = int(trig_norm * 255)
             pct = int(trig_norm * 100)
-            self.live_state[target] = pct
-            self.live_state["buttons"][target] = (pct > 15)
-            if self.vpad:
-                self.vpad.emit_abs(ABS_Z if target == "lt" else ABS_RZ, trig_val)
+            if target in ("lt", "rt"):
+                self.live_state[target] = pct
+                self.live_state["buttons"][target] = (pct > 15)
+                if self.vpad:
+                    self.vpad.emit_abs(ABS_Z if target == "lt" else ABS_RZ, trig_val)
+            else:
+                # Analog trigger swapped to digital bumper (trigger_bumper_swap)
+                is_pressed = (pct > 30)
+                self.live_state["buttons"][target] = is_pressed
+                if self.vpad:
+                    self.vpad.emit_key(BTN_TL if target == "lb" else BTN_TR, is_pressed)
             return
 
         mid = (val_min + val_max) / 2.0
@@ -643,11 +700,7 @@ class GamepadWorker(threading.Thread):
         self.live_state["raw_" + live_key] = round(raw_norm, 3)
         self.live_state[live_key] = round(adj, 2)
 
-        if abs(adj) < dz:
-            scaled = 0.0
-        else:
-            # Smoothly rescale remaining travel so 100% reach is preserved for larger deadzones
-            scaled = ((abs(adj) - dz) / max(0.01, 1.0 - dz)) * (1.0 if adj > 0 else -1.0)
+        scaled = apply_stick_curve(adj, deadzone=dz, outer_scale=outer_scale, curve=curve)
         xbox_val = int(max(-1.0, min(1.0, scaled)) * 32767)
         if self.vpad:
             self.vpad.emit_abs(xbox_code, xbox_val)
@@ -685,14 +738,32 @@ class GamepadWorker(threading.Thread):
                     "player_num": self.player_num,
                     "deadzone_left": self.deadzone_left,
                     "deadzone_right": self.deadzone_right,
+                    "outer_scale": self.outer_scale,
+                    "sensitivity_curve": self.sensitivity_curve,
+                    "nintendo_swap": self.nintendo_swap,
+                    "trigger_bumper_swap": self.trigger_bumper_swap,
                     "rumble_enabled": self.rumble_enabled,
                 }
                 state.live_inputs[self.player_num] = copy.deepcopy(self.live_state)
+            state.notify_ui()
 
             while not self._stop_event.is_set():
                 fd = self.dev_fd
                 if fd is None:
                     break
+
+                if self._rumble_test_req.is_set():
+                    self._rumble_test_req.clear()
+                    if self._test_ff_id is not None:
+                        stop_physical_rumble_pulse(fd, self._test_ff_id)
+                        self._test_ff_id = None
+                    if self.phys_ff:
+                        self._test_ff_id = start_physical_rumble_pulse(fd, duration_ms=280)
+                        self._rumble_test_stop_at = time.monotonic() + 0.30
+                elif self._test_ff_id is not None and time.monotonic() >= self._rumble_test_stop_at:
+                    stop_physical_rumble_pulse(fd, self._test_ff_id)
+                    self._test_ff_id = None
+
                 watch_fds = [fd]
                 if self.vpad is not None and self.vpad.fd is not None and self.vpad.enable_rumble:
                     watch_fds.append(self.vpad.fd)
@@ -752,6 +823,7 @@ class GamepadWorker(threading.Thread):
                 with state.lock:
                     if state.active_slots.get(self.player_num, {}) and state.active_slots[self.player_num].get("identifier") == self.identifier:
                         state.live_inputs[self.player_num] = copy.deepcopy(self.live_state)
+                state.notify_ui()
         finally:
             self._cleanup_once()
 
@@ -771,6 +843,9 @@ class GamepadWorker(threading.Thread):
         fd = self.dev_fd
         self.dev_fd = None
         if fd is not None:
+            if self._test_ff_id is not None:
+                stop_physical_rumble_pulse(fd, self._test_ff_id)
+                self._test_ff_id = None
             if self.bridge_mode:
                 try:
                     fcntl.ioctl(fd, EVIOCGRAB, 0)
@@ -785,6 +860,7 @@ class GamepadWorker(threading.Thread):
         self.vpad = None
         if vpad is not None:
             vpad.close()
+        state.notify_ui()
 
     def stop(self, wait=True):
         """Signal loop termination and optionally join worker thread so resources close cleanly."""
@@ -804,6 +880,35 @@ def _pick_slot_for_device(gp, assigned_slots, slot_overrides, slot_pins):
         if slot not in assigned_slots:
             return slot
     return None
+
+
+def udev_netlink_watcher():
+    """Listen to Linux kernel NETLINK_KOBJECT_UEVENT for instant USB/BT gamepad hotplug wakeup."""
+    NETLINK_KOBJECT_UEVENT = 15
+    try:
+        sock = socket.socket(socket.AF_NETLINK, socket.SOCK_DGRAM, NETLINK_KOBJECT_UEVENT)
+        sock.bind((os.getpid(), 1))
+        sock.setblocking(False)
+    except OSError:
+        return  # Restricted sandbox / container: device_supervisor fallback polling handles detection
+
+    try:
+        while not state.shutdown_event.is_set():
+            readable, _, _ = select.select([sock], [], [], 1.0)
+            if not readable:
+                continue
+            try:
+                raw = sock.recv(8192)
+            except OSError:
+                break
+            lower = raw.lower()
+            if b"subsystem=input" in lower or b"subsystem=usb" in lower or b"event" in lower:
+                state.supervisor_wakeup.set()
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def device_supervisor():
@@ -900,12 +1005,13 @@ def device_supervisor():
                     elif ident in state.workers and state.workers[ident].is_alive():
                         retry_backoff.pop(ident, None)
 
+            state.notify_ui()
         except Exception as exc:
             import traceback
             print(f"[Supervisor] Error en ciclo de detección: {exc}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
 
-        state.supervisor_wakeup.wait(timeout=0.75)
+        state.supervisor_wakeup.wait(timeout=3.0)
 
 
 def _update_from_github():
@@ -997,14 +1103,59 @@ def _build_full_export_zip():
     return buf.read()
 
 
+def _build_status_payload():
+    """Construct current dashboard snapshot safely under state.lock."""
+    profiles = load_profiles()
+    with state.lock:
+        connected = copy.deepcopy(state.connected_devices)
+        uncalibrated = [
+            gp for gp in connected
+            if f"{gp.get('vendor')}:{gp.get('product')}" not in profiles
+        ]
+        return {
+            "bridge_enabled": state.bridge_enabled,
+            "active_slots": copy.deepcopy(state.active_slots),
+            "live_inputs": copy.deepcopy(state.live_inputs),
+            "polling_hz": max((int(inp.get("polling_hz", 0)) for inp in state.live_inputs.values()), default=0),
+            "lan_protected": state.lan_token is not None,
+            "connected_devices": connected,
+            "uncalibrated_devices": uncalibrated,
+            "device_errors": copy.deepcopy(state.device_errors),
+            "profile_revision": state.profile_revision,
+        }
+
+
 class ResiticksHTTPHandler(BaseHTTPRequestHandler):
     """HTTP API & dashboard request handler for Resiticks."""
 
     def log_message(self, format, *args):
         pass
 
-    def _is_valid_local_origin(self, require_same_origin=False):
-        """Reject DNS rebinding (Host) and cross-origin browser CSRF (Origin/Referer)."""
+    def _extract_lan_token(self, url):
+        """Read ephemeral LAN token from query parameter, Bearer header, or HttpOnly cookie."""
+        qs = urllib.parse.parse_qs(url.query)
+        if qs.get("token"):
+            return qs["token"][0]
+        auth = self.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            return auth[7:].strip()
+        cookie = self.headers.get("Cookie", "")
+        for part in cookie.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == "resiticks_token":
+                return v.strip()
+        return ""
+
+    def _is_valid_local_origin(self, require_same_origin=False, url=None):
+        """Reject DNS rebinding (Host), cross-origin CSRF, or unauthorized LAN requests."""
+        lan_tok = state.lan_token
+        if lan_tok is not None:
+            parsed_url = url or urllib.parse.urlparse(self.path)
+            supplied = self._extract_lan_token(parsed_url)
+            if not supplied or not secrets.compare_digest(supplied, lan_tok):
+                return False
+            return True
+
         host_hdr = self.headers.get("Host", "")
         if host_hdr:
             parsed_host = urllib.parse.urlsplit("//" + host_hdr).hostname or ""
@@ -1057,38 +1208,57 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def do_OPTIONS(self):
-        if not self._is_valid_local_origin(require_same_origin=True):
-            self._send_json(403, {"error": "Origen no permitido"})
+        url = urllib.parse.urlparse(self.path)
+        if not self._is_valid_local_origin(require_same_origin=True, url=url):
+            self._send_json(403, {"error": "Origen o token no permitido"})
             return
         self._send_bytes(204, "text/plain", b"")
 
     def do_GET(self):
-        if not self._is_valid_local_origin(require_same_origin=False):
-            self._send_json(403, {"error": "Host local inválido"})
-            return
         url = urllib.parse.urlparse(self.path)
+        if not self._is_valid_local_origin(require_same_origin=False, url=url):
+            status_code = 401 if state.lan_token is not None else 403
+            self._send_json(status_code, {"error": "Acceso denegado / Token inválido"})
+            return
         if url.path in ("/", "/index.html"):
-            self._send_bytes(200, "text/html; charset=utf-8", HTML_PAGE.encode("utf-8"))
+            extra = {}
+            if state.lan_token is not None:
+                extra["Set-Cookie"] = f"resiticks_token={state.lan_token}; HttpOnly; SameSite=Strict; Path=/"
+            self._send_bytes(200, "text/html; charset=utf-8", HTML_PAGE.encode("utf-8"), extra_headers=extra or None)
             return
 
         if url.path == "/api/status":
-            profiles = load_profiles()
-            with state.lock:
-                connected = copy.deepcopy(state.connected_devices)
-                uncalibrated = [
-                    gp for gp in connected
-                    if f"{gp.get('vendor')}:{gp.get('product')}" not in profiles
-                ]
-                payload = {
-                    "bridge_enabled": state.bridge_enabled,
-                    "active_slots": copy.deepcopy(state.active_slots),
-                    "live_inputs": copy.deepcopy(state.live_inputs),
-                    "connected_devices": connected,
-                    "uncalibrated_devices": uncalibrated,
-                    "device_errors": copy.deepcopy(state.device_errors),
-                    "profile_revision": state.profile_revision,
-                }
-            self._send_json(200, payload)
+            self._send_json(200, _build_status_payload())
+            return
+
+        if url.path == "/api/stream":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            last_seq = -1
+            last_sent_ts = 0.0
+            try:
+                while not state.shutdown_event.is_set():
+                    with state.ui_cond:
+                        if state.ui_seq == last_seq:
+                            state.ui_cond.wait(timeout=2.5)
+                        cur_seq = state.ui_seq
+                    now = time.monotonic()
+                    if cur_seq != last_seq:
+                        last_seq = cur_seq
+                        last_sent_ts = now
+                        data = json.dumps(_build_status_payload(), ensure_ascii=False)
+                        self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    elif now - last_sent_ts >= 2.5:
+                        last_sent_ts = now
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
             return
 
         if url.path == "/api/profiles":
@@ -1100,6 +1270,10 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
                     "product": p.get("product"),
                     "deadzone_left": p.get("deadzone_left", 0.05),
                     "deadzone_right": p.get("deadzone_right", 0.05),
+                    "outer_scale": p.get("outer_scale", 1.0),
+                    "sensitivity_curve": p.get("sensitivity_curve", "linear"),
+                    "nintendo_swap": bool(p.get("nintendo_swap", False)),
+                    "trigger_bumper_swap": bool(p.get("trigger_bumper_swap", False)),
                     "rumble_enabled": p.get("rumble_enabled", True),
                     "center_offset": p.get("center_offset", {}),
                 }
@@ -1132,10 +1306,11 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "Endpoint no encontrado"})
 
     def do_POST(self):
-        if not self._is_valid_local_origin(require_same_origin=True):
-            self._send_json(403, {"error": "Petición cross-origin bloqueada por seguridad"})
-            return
         url = urllib.parse.urlparse(self.path)
+        if not self._is_valid_local_origin(require_same_origin=True, url=url):
+            status_code = 401 if state.lan_token is not None else 403
+            self._send_json(status_code, {"error": "Petición cross-origin o token inválido"})
+            return
         try:
             body = self._read_json_body()
         except Exception as exc:
@@ -1149,6 +1324,7 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
                 pins = dict(state.slot_pins)
             save_config({"bridge_enabled": enabled, "slot_pins": pins})
             state.supervisor_wakeup.set()
+            state.notify_ui()
             self._send_json(200, {"bridge_enabled": enabled})
             return
 
@@ -1171,6 +1347,7 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
             for w in to_restart:
                 w.stop(wait=True)
             state.supervisor_wakeup.set()
+            state.notify_ui()
             self._send_json(200, {"swapped": [from_slot, to_slot]})
             return
 
@@ -1184,6 +1361,7 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
                 state.slot_pins[pin_key] = slot
                 cfg = {"bridge_enabled": state.bridge_enabled, "slot_pins": dict(state.slot_pins)}
             save_config(cfg)
+            state.notify_ui()
             self._send_json(200, {"pinned": pin_key, "slot": slot})
             return
 
@@ -1199,6 +1377,14 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
                 prof["deadzone_left"] = max(0.01, min(0.45, float(body["deadzone_left"])))
             if "deadzone_right" in body:
                 prof["deadzone_right"] = max(0.01, min(0.45, float(body["deadzone_right"])))
+            if "outer_scale" in body:
+                prof["outer_scale"] = max(1.0, min(1.5, float(body["outer_scale"])))
+            if "sensitivity_curve" in body and body["sensitivity_curve"] in ("linear", "precise", "aggressive"):
+                prof["sensitivity_curve"] = str(body["sensitivity_curve"])
+            if "nintendo_swap" in body:
+                prof["nintendo_swap"] = bool(body["nintendo_swap"])
+            if "trigger_bumper_swap" in body:
+                prof["trigger_bumper_swap"] = bool(body["trigger_bumper_swap"])
             if "rumble_enabled" in body:
                 prof["rumble_enabled"] = bool(body["rumble_enabled"])
             if "center_offset" in body and isinstance(body["center_offset"], dict):
@@ -1207,7 +1393,22 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
             with state.lock:
                 state.profile_revision += 1
             state.supervisor_wakeup.set()
+            state.notify_ui()
             self._send_json(200, {"ok": True})
+            return
+
+        if url.path == "/api/slot/test_rumble":
+            slot = int(body.get("slot", 0))
+            with state.lock:
+                w = next((wrk for wrk in state.workers.values() if wrk.player_num == slot), None)
+            if not w:
+                self._send_json(404, {"error": "Slot vacío o inactivo"})
+                return
+            if not w.phys_ff:
+                self._send_json(200, {"ok": False, "message": "El mando físico no reporta soporte EV_FF de vibración"})
+                return
+            w.trigger_test_rumble()
+            self._send_json(200, {"ok": True, "slot": slot})
             return
 
         if url.path == "/api/profile/center_zero":
@@ -1365,33 +1566,46 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    """Boot device supervisor, start ThreadingHTTPServer cleanly, and open browser."""
+    """Boot netlink watcher, device supervisor, ThreadingHTTPServer, and optional browser/LAN/daemon."""
     parser = argparse.ArgumentParser(description="Resiticks — Hub Universal de Joysticks")
     parser.add_argument("--port", type=int, default=8765, help="Puerto HTTP local (default: 8765)")
     parser.add_argument("--no-browser", action="store_true", help="No abrir ventana de navegador al iniciar")
+    parser.add_argument("--daemon", action="store_true", help="Modo demonio en segundo plano (sin navegador)")
+    parser.add_argument("--lan", action="store_true", help="Permitir acceso seguro en red local con token efímero")
     args = parser.parse_args()
 
-    url = f"http://127.0.0.1:{args.port}"
+    no_browser = args.no_browser or args.daemon
+    bind_host = "0.0.0.0" if args.lan else "127.0.0.1"
+    if args.lan:
+        state.lan_token = secrets.token_urlsafe(16)
+        url = f"http://127.0.0.1:{args.port}/?token={state.lan_token}"
+    else:
+        url = f"http://127.0.0.1:{args.port}"
+
     print("=" * 65)
     print(" 🎮 Resiticks — Hub de Joysticks (8 Jugadores)")
     print(f" 📂 Perfiles: {resolve_profiles_dir()}")
+    if args.lan:
+        print(f" 🔐 Modo LAN seguro activado — Token de sesión: {state.lan_token}")
     print("=" * 65)
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", args.port), ResiticksHTTPHandler)
+        server = ThreadingHTTPServer((bind_host, args.port), ResiticksHTTPHandler)
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             print(f"ℹ️  Resiticks ya está corriendo en {url}. Abriendo panel...")
-            if not args.no_browser:
+            if not no_browser:
                 launch_browser_url(url)
             sys.exit(0)
         raise
 
     sup_thread = threading.Thread(target=device_supervisor, daemon=True)
     sup_thread.start()
+    nl_thread = threading.Thread(target=udev_netlink_watcher, daemon=True)
+    nl_thread.start()
 
     print(f" 🚀 Servidor Resiticks corriendo en: {url}")
-    if not args.no_browser:
+    if not no_browser:
         browser = launch_browser_url(url)
         if not browser:
             print(f"Abrí {url} en tu navegador.")
@@ -1409,6 +1623,7 @@ def main():
         cal_session.cancel()
         state.shutdown_event.set()
         state.supervisor_wakeup.set()
+        state.notify_ui()
         with state.lock:
             workers = list(state.workers.values())
             state.workers.clear()

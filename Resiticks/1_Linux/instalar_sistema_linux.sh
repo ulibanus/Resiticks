@@ -31,6 +31,22 @@ EOF
 
 echo "✅ Lanzadores instalados en $BIN_DIR/resiticks y menú de aplicaciones."
 
+# 1b. Servicio systemd --user en segundo plano (opcional con --enable-service)
+if [ -f "$SCRIPT_DIR/resiticks.service" ] && command -v systemctl >/dev/null 2>&1; then
+  SYSTEMD_USER_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$SYSTEMD_USER_DIR"
+  cp "$SCRIPT_DIR/resiticks.service" "$SYSTEMD_USER_DIR/resiticks.service"
+  systemctl --user daemon-reload >/dev/null 2>&1 || true
+  if [ "$1" = "--enable-service" ]; then
+    systemctl --user enable --now resiticks.service
+    echo "✅ Servicio systemd --user habilitado e iniciado en segundo plano (--daemon)."
+  else
+    echo "ℹ️  Plantilla systemd instalada en $SYSTEMD_USER_DIR/resiticks.service."
+    echo "   Para iniciar Resiticks automáticamente al iniciar sesión ejecutá:"
+    echo "   systemctl --user enable --now resiticks.service"
+  fi
+fi
+
 # 2. Verificar permisos de /dev/uinput y grupo input
 if [ ! -w /dev/uinput ] || ! id -nG "$USER" | grep -qw input; then
   echo ""

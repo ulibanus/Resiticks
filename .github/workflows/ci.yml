@@ -1,0 +1,39 @@
+name: Resiticks CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Syntax checks (Python & Bash)
+        run: |
+          python3 -m py_compile Resiticks/1_Linux/*.py Resiticks/2_Windows/*.py Resiticks/tests/*.py
+          bash -n Resiticks/1_Linux/*.sh Resiticks/actualizar.sh
+
+      - name: Run automated test suite
+        run: python3 Resiticks/tests/test_resiticks.py -v
+
+      - name: Package portable Resiticks.zip artifact
+        run: |
+          zip -r Resiticks.zip Resiticks/ README.md -x "*/__pycache__/*" "*.pyc"
+          unzip -tq Resiticks.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Resiticks-portable
+          path: Resiticks.zip

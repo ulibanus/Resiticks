@@ -362,7 +362,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
     <div class="insp-tuning">
       <div class="insp-tune-head">
-        <span>Ajuste Anti-Drift en Vivo</span>
+        <span>Ajuste Anti-Drift &amp; Respuesta Pro</span>
         <span id="insp-tune-slot-lbl" style="color:#60a5fa;">Slot 1</span>
       </div>
       <div class="tune-slider-block">
@@ -373,7 +373,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div><span>Zona Muerta Stick Der (R):</span><b id="insp-val-dzr">8%</b></div>
         <input type="range" id="insp-input-dzr" min="2" max="30" value="8" oninput="onInspDeadzoneInput('right', this.value)" onchange="onInspDeadzoneChange('right', this.value)">
       </div>
-      <div style="display:flex; justify-content:space-between; align-items:center; padding-top:4px;">
+      <div class="tune-slider-block">
+        <div><span>Alcance Diagonal (Outer Scale):</span><b id="insp-val-outer">100%</b></div>
+        <input type="range" id="insp-input-outer" min="100" max="135" value="100" oninput="document.getElementById('insp-val-outer').textContent=this.value+'%'" onchange="onInspProTune({outer_scale: Number(this.value)/100})">
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+        <span style="color:var(--text-sub);">Curva Stick:</span>
+        <select id="insp-sel-curve" onchange="onInspProTune({sensitivity_curve: this.value})" style="background:#18233b; color:#e2e8f0; border:1px solid #2b3c63; border-radius:6px; padding:4px 8px; font-size:11.5px;">
+          <option value="linear">Lineal (Estándar)</option>
+          <option value="precise">Precisión PES (Suave)</option>
+          <option value="aggressive">Rápida (Agresiva)</option>
+        </select>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding-top:2px;">
+        <label style="display:flex; align-items:center; gap:6px; cursor:pointer; color:var(--text-sub);">
+          <input type="checkbox" id="insp-chk-nintendo" onchange="onInspProTune({nintendo_swap: this.checked})">
+          <span>Layout Nintendo (A↔B, X↔Y)</span>
+        </label>
+        <label style="display:flex; align-items:center; gap:6px; cursor:pointer; color:var(--text-sub);">
+          <input type="checkbox" id="insp-chk-trigswap" onchange="onInspProTune({trigger_bumper_swap: this.checked})">
+          <span>PS2 (LT↔LB)</span>
+        </label>
+      </div>
+      <div style="display:flex; justify-content:space-between; align-items:center; padding-top:4px; border-top:1px solid #1a2540;">
         <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
           <input type="checkbox" id="insp-chk-rumble" onchange="onInspRumbleChange(this.checked)">
           <span>📳 Vibración (Rumble)</span>
@@ -386,7 +408,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <div class="insp-btn primary" onclick="inspRecalibrate()">🎯 Recalibrar PES</div>
       <div class="insp-btn" onclick="inspCenterZero()">⊕ Centrar Sticks</div>
       <div class="insp-btn" onclick="inspPromptMoveSlot()">⇄ Mover Slot</div>
-      <div class="insp-btn" onclick="inspPinSlot()">📌 Fijar Slot</div>
+      <div class="insp-btn" onclick="inspTestRumble()">📳 Probar Vibración</div>
+      <div class="insp-btn" style="grid-column:span 2;" onclick="inspPinSlot()">📌 Fijar Puerto USB al Slot</div>
     </div>
   </aside>
 </div>
@@ -590,6 +613,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         document.getElementById('insp-input-dzr').value = dzR;
         document.getElementById('insp-val-dzr').textContent = dzR + '%';
       }
+      const outerPct = Math.round((it.outer_scale ?? 1.0) * 100);
+      if (document.activeElement !== document.getElementById('insp-input-outer')) {
+        document.getElementById('insp-input-outer').value = outerPct;
+        document.getElementById('insp-val-outer').textContent = outerPct + '%';
+      }
+      document.getElementById('insp-sel-curve').value = it.sensitivity_curve || 'linear';
+      document.getElementById('insp-chk-nintendo').checked = Boolean(it.nintendo_swap);
+      document.getElementById('insp-chk-trigswap').checked = Boolean(it.trigger_bumper_swap);
       document.getElementById('insp-chk-rumble').checked = rumOn;
       document.getElementById('insp-lbl-rumble').textContent = rumOn ? 'Activa' : 'Pausada';
       document.getElementById('insp-lbl-rumble').style.color = rumOn ? '#34d399' : '#94a3b8';
@@ -598,6 +629,28 @@ HTML_PAGE = r"""<!DOCTYPE html>
       sub.textContent = 'No hay joystick físico asignado a este slot';
       badge.style.display = 'none';
     }
+  }
+
+  async function onInspProTune(payload) {
+    const data = lastStatusData;
+    const it = data && (data.active_slots[String(selectedSlot)] || data.active_slots[selectedSlot]);
+    if (!it) return;
+    await fetch('/api/profile/tune', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ vendor: it.vendor, product: it.product }, payload))
+    });
+  }
+
+  async function inspTestRumble() {
+    const res = await fetch('/api/slot/test_rumble', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ slot: selectedSlot })
+    });
+    const out = await res.json();
+    if (!res.ok) alert(out.error || 'No se pudo probar vibración.');
+    else if (out.ok === false) alert(out.message || 'El mando no reporta soporte de vibración.');
   }
 
   function onInspDeadzoneInput(side, val) {
@@ -819,87 +872,88 @@ HTML_PAGE = r"""<!DOCTYPE html>
     }
   }
 
+  function applyStatusPayload(data) {
+    lastStatusData = data;
+    failCount = 0;
+    document.getElementById('conn-banner').className = 'alert-banner';
+
+    updateBridgeUI(Boolean(data.bridge_enabled));
+    renderBanners(data);
+
+    let activeCount = 0;
+    let maxHz = 0;
+    for (let s = 1; s <= 8; s++) {
+      if (data.active_slots[String(s)] || data.active_slots[s]) {
+        activeCount++;
+        const inp = data.live_inputs[String(s)] || data.live_inputs[s];
+        if (inp && inp.polling_hz > maxHz) maxHz = inp.polling_hz;
+      }
+    }
+    document.getElementById('metrics-vpad-count').textContent = `${activeCount} Activo${activeCount === 1 ? '' : 's'}`;
+    const hzEl = document.getElementById('metrics-polling-hz');
+    if (hzEl) hzEl.textContent = maxHz > 0 ? `${maxHz} Hz` : (activeCount > 0 ? 'Reposo' : '-- Hz');
+
+    if (data.profile_revision !== lastProfilesRev) {
+      lastProfilesRev = data.profile_revision;
+      if (document.getElementById('tab-profiles').classList.contains('active') || lastProfilesRev === 0) {
+        loadProfilesList();
+      }
+    }
+
+    // Rebuild DOM cards ONLY when slot occupancy/config changes, preserving clicks/sliders
+    const sigObj = {};
+    for (let s = 1; s <= 8; s++) {
+      const it = data.active_slots[String(s)] || data.active_slots[s];
+      sigObj[s] = it ? `${it.vendor}:${it.product}:${it.dev_path}:${it.name}:${it.rumble_enabled}:${it.outer_scale}:${it.sensitivity_curve}:${it.nintendo_swap}:${it.trigger_bumper_swap}` : null;
+    }
+    const sig = JSON.stringify(sigObj);
+    const container = document.getElementById('slots-container');
+    const extraPills = document.getElementById('extra-slots-pills');
+
+    if (sig !== lastSlotsSig) {
+      lastSlotsSig = sig;
+      let html1to4 = '';
+      for (let s = 1; s <= 4; s++) {
+        const item = data.active_slots[String(s)] || data.active_slots[s];
+        html1to4 += item ? buildConnectedSlotTile(s, item) : buildEmptySlotTile(s);
+      }
+      for (let s = 5; s <= 8; s++) {
+        const item = data.active_slots[String(s)] || data.active_slots[s];
+        html1to4 += `<div style="display:none;" id="slot-card-${s}">${item ? buildConnectedSlotTile(s, item) : buildEmptySlotTile(s)}</div>`;
+      }
+      container.innerHTML = html1to4;
+
+      let extraHtml = '';
+      for (let s = 5; s <= 8; s++) {
+        const item = data.active_slots[String(s)] || data.active_slots[s];
+        const occ = item ? 'occupied' : '';
+        const sel = s === selectedSlot ? 'selected' : '';
+        extraHtml += `<div class="extra-pill ${occ} ${sel}" data-slot="${s}" onclick="selectSlot(${s})">P${s} · ${item ? escapeHtml(item.name).slice(0, 10) : 'Libre'}</div>`;
+      }
+      extraPills.innerHTML = extraHtml;
+
+      const curItem = data.active_slots[String(selectedSlot)] || data.active_slots[selectedSlot];
+      if (!curItem) {
+        for (let s = 1; s <= 8; s++) {
+          if (data.active_slots[String(s)] || data.active_slots[s]) { selectSlot(s); break; }
+        }
+      }
+      updateInspectorCardHeader();
+    }
+
+    for (let s = 1; s <= 8; s++) {
+      const item = data.active_slots[String(s)] || data.active_slots[s];
+      const inp = data.live_inputs[String(s)] || data.live_inputs[s] || {};
+      updateSlotLiveTelemetry(s, item, inp);
+    }
+  }
+
   async function updateDashboard() {
     if (document.hidden) return;
     try {
       const res = await fetch('/api/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      lastStatusData = data;
-      failCount = 0;
-      document.getElementById('conn-banner').className = 'alert-banner';
-
-      updateBridgeUI(Boolean(data.bridge_enabled));
-      renderBanners(data);
-
-      let activeCount = 0;
-      let maxHz = 0;
-      for (let s = 1; s <= 8; s++) {
-        if (data.active_slots[String(s)] || data.active_slots[s]) {
-          activeCount++;
-          const inp = data.live_inputs[String(s)] || data.live_inputs[s];
-          if (inp && inp.polling_hz > maxHz) maxHz = inp.polling_hz;
-        }
-      }
-      document.getElementById('metrics-vpad-count').textContent = `${activeCount} Activo${activeCount === 1 ? '' : 's'}`;
-      const hzEl = document.getElementById('metrics-polling-hz');
-      if (hzEl) hzEl.textContent = maxHz > 0 ? `${maxHz} Hz` : (activeCount > 0 ? 'Reposo' : '-- Hz');
-
-      if (data.profile_revision !== lastProfilesRev) {
-        lastProfilesRev = data.profile_revision;
-        if (document.getElementById('tab-profiles').classList.contains('active') || lastProfilesRev === 0) {
-          loadProfilesList();
-        }
-      }
-
-      // Rebuild DOM cards ONLY when slot occupancy/config changes, preserving clicks/sliders
-      const sigObj = {};
-      for (let s = 1; s <= 8; s++) {
-        const it = data.active_slots[String(s)] || data.active_slots[s];
-        sigObj[s] = it ? `${it.vendor}:${it.product}:${it.dev_path}:${it.name}:${it.rumble_enabled}` : null;
-      }
-      const sig = JSON.stringify(sigObj);
-      const container = document.getElementById('slots-container');
-      const extraPills = document.getElementById('extra-slots-pills');
-
-      if (sig !== lastSlotsSig) {
-        lastSlotsSig = sig;
-        let html1to4 = '';
-        for (let s = 1; s <= 4; s++) {
-          const item = data.active_slots[String(s)] || data.active_slots[s];
-          html1to4 += item ? buildConnectedSlotTile(s, item) : buildEmptySlotTile(s);
-        }
-        // Slots 5 to 8 also rendered as hidden DOM elements if needed for tests, or pills
-        for (let s = 5; s <= 8; s++) {
-          const item = data.active_slots[String(s)] || data.active_slots[s];
-          html1to4 += `<div style="display:none;" id="slot-card-${s}">${item ? buildConnectedSlotTile(s, item) : buildEmptySlotTile(s)}</div>`;
-        }
-        container.innerHTML = html1to4;
-
-        let extraHtml = '';
-        for (let s = 5; s <= 8; s++) {
-          const item = data.active_slots[String(s)] || data.active_slots[s];
-          const occ = item ? 'occupied' : '';
-          const sel = s === selectedSlot ? 'selected' : '';
-          extraHtml += `<div class="extra-pill ${occ} ${sel}" data-slot="${s}" onclick="selectSlot(${s})">P${s} · ${item ? escapeHtml(item.name).slice(0, 10) : 'Libre'}</div>`;
-        }
-        extraPills.innerHTML = extraHtml;
-
-        // Auto-select first active slot if current selectedSlot is empty
-        const curItem = data.active_slots[String(selectedSlot)] || data.active_slots[selectedSlot];
-        if (!curItem) {
-          for (let s = 1; s <= 8; s++) {
-            if (data.active_slots[String(s)] || data.active_slots[s]) { selectSlot(s); break; }
-          }
-        }
-        updateInspectorCardHeader();
-      }
-
-      for (let s = 1; s <= 8; s++) {
-        const item = data.active_slots[String(s)] || data.active_slots[s];
-        const inp = data.live_inputs[String(s)] || data.live_inputs[s] || {};
-        updateSlotLiveTelemetry(s, item, inp);
-      }
+      applyStatusPayload(await res.json());
     } catch (e) {
       failCount += 1;
       if (failCount >= 3) {
@@ -908,6 +962,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
         cb.textContent = '🔴 Sin conexión con el motor Resiticks (127.0.0.1:8765). Verificá que app.py esté corriendo.';
       }
     }
+  }
+
+  let liveEventSource = null;
+  function connectLiveStream() {
+    if (document.hidden || typeof EventSource === 'undefined') return;
+    if (liveEventSource) { liveEventSource.close(); liveEventSource = null; }
+    liveEventSource = new EventSource('/api/stream');
+    liveEventSource.onmessage = (ev) => {
+      try { applyStatusPayload(JSON.parse(ev.data)); } catch (e) {}
+    };
+    liveEventSource.onerror = () => {
+      if (liveEventSource) { liveEventSource.close(); liveEventSource = null; }
+    };
   }
 
   async function loadProfilesList() {
@@ -1177,10 +1244,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) updateDashboard();
+    if (document.hidden) {
+      if (liveEventSource) { liveEventSource.close(); liveEventSource = null; }
+    } else {
+      updateDashboard();
+      connectLiveStream();
+    }
   });
-  setInterval(updateDashboard, 90);
+  setInterval(() => {
+    if (!liveEventSource || liveEventSource.readyState === 2) {
+      updateDashboard();
+      if (!liveEventSource && !document.hidden) connectLiveStream();
+    }
+  }, 2500);
+  window.addEventListener('pagehide', () => {
+    if (liveEventSource) { liveEventSource.close(); liveEventSource = null; }
+  });
   updateDashboard();
+  setTimeout(connectLiveStream, 2000);
   loadProfilesList();
 </script>
 </body>

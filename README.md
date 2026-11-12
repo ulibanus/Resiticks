@@ -39,6 +39,11 @@ cd Resiticks/1_Linux
 ./iniciar_resiticks.sh
 ```
 
+Opciones avanzadas desde consola:
+- `resiticks --daemon`: ejecuta en segundo plano sin abrir el navegador.
+- `resiticks --lan`: habilita acceso remoto en red local protegido por token aleatorio efímero.
+- `./instalar_sistema_linux.sh --enable-service`: instala e inicia `resiticks.service` vía `systemd --user`.
+
 Si es tu primera vez en una distro nueva sin acceso a `/dev/uinput`, ejecutá una sola vez:
 ```bash
 cd Resiticks/1_Linux

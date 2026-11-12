@@ -611,5 +611,152 @@ class TestSecurityAndPerformance(unittest.TestCase):
             srv.server_close()
 
 
+class TestFases234Features(unittest.TestCase):
+    def test_sse_stream_delivers_status_json(self):
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), res_app.ResiticksHTTPHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/stream", timeout=3) as r:
+                self.assertEqual(r.status, 200)
+                self.assertTrue(r.headers.get("Content-Type", "").startswith("text/event-stream"))
+                line = b""
+                for _ in range(10):
+                    raw = r.readline()
+                    if raw.startswith(b"data: "):
+                        line = raw
+                        break
+                self.assertTrue(line.startswith(b"data: "))
+                payload = json.loads(line[6:].decode("utf-8"))
+                self.assertIn("active_slots", payload)
+                self.assertIn("polling_hz", payload)
+                self.assertIn("lan_protected", payload)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_lan_token_auth_blocks_and_authorizes(self):
+        from http.server import ThreadingHTTPServer
+        orig_token = res_app.state.lan_token
+        res_app.state.lan_token = "secret_lan_tok"
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), res_app.ResiticksHTTPHandler)
+        port = srv.server_address[1]
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(base + "/api/status", timeout=3)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+            with urllib.request.urlopen(base + "/?token=secret_lan_tok", timeout=3) as r:
+                self.assertEqual(r.status, 200)
+                cookie = r.headers.get("Set-Cookie", "")
+                self.assertIn("resiticks_token=secret_lan_tok", cookie)
+                self.assertIn("HttpOnly", cookie)
+
+            req_cookie = urllib.request.Request(
+                base + "/api/status",
+                headers={"Cookie": "resiticks_token=secret_lan_tok"},
+            )
+            with urllib.request.urlopen(req_cookie, timeout=3) as rc:
+                self.assertEqual(rc.status, 200)
+
+            req_bearer = urllib.request.Request(
+                base + "/api/status",
+                headers={"Authorization": "Bearer secret_lan_tok"},
+            )
+            with urllib.request.urlopen(req_bearer, timeout=3) as r2:
+                self.assertEqual(r2.status, 200)
+                data = json.loads(r2.read().decode())
+                self.assertTrue(data["lan_protected"])
+        finally:
+            res_app.state.lan_token = orig_token
+            srv.shutdown()
+            srv.server_close()
+
+    def test_stick_curves_and_outer_scale(self):
+        # Diagonal circular stick (~0.707) scaled by 1.35x clamps nicely toward full outer reach
+        diag = evdev_utils.apply_stick_curve(0.75, deadzone=0.05, outer_scale=1.35, curve="linear")
+        self.assertGreater(diag, 0.95)
+        self.assertLessEqual(diag, 1.0)
+
+        lin = evdev_utils.apply_stick_curve(0.50, deadzone=0.0, outer_scale=1.0, curve="linear")
+        prec = evdev_utils.apply_stick_curve(0.50, deadzone=0.0, outer_scale=1.0, curve="precise")
+        aggr = evdev_utils.apply_stick_curve(0.50, deadzone=0.0, outer_scale=1.0, curve="aggressive")
+        self.assertLess(prec, lin)
+        self.assertLess(lin, aggr)
+        self.assertAlmostEqual(prec, 0.5 ** 1.45, places=3)
+
+    def test_windows_swaps_and_curve(self):
+        prof = {
+            "vendor": "057e",
+            "product": "2009",
+            "nintendo_swap": True,
+            "trigger_bumper_swap": True,
+            "mapping": {
+                "a": {"type": "btn", "code": 304},
+                "b": {"type": "btn", "code": 305},
+                "x": {"type": "btn", "code": 307},
+                "y": {"type": "btn", "code": 308},
+                "lb": {"type": "btn", "code": 310},
+                "lt": {"type": "btn", "code": 312},
+            },
+        }
+        wmap = resiticks_windows.build_windows_translation(prof, num_axes=4, num_buttons=12, num_hats=1)
+        # a(304->0) and b(305->1) are swapped; lb(310->4) and lt(312->compact 5) are swapped
+        self.assertEqual(wmap["buttons"]["a"], 1)
+        self.assertEqual(wmap["buttons"]["b"], 0)
+        self.assertEqual(wmap["buttons"]["lb"], 5)
+        self.assertEqual(wmap["buttons"]["lt"], 4)
+        self.assertAlmostEqual(
+            resiticks_windows._apply_deadzone(0.5, 0.0, outer_scale=1.0, curve="precise"),
+            0.5 ** 1.45,
+            places=3,
+        )
+
+    @unittest.skipUnless(_uinput_writable(), "/dev/uinput not writable")
+    def test_worker_swaps_and_test_rumble_e2e(self):
+        with open(os.path.join(PROFILES_DIR, "0079_0006.json"), "r", encoding="utf-8") as f:
+            prof = json.load(f)
+        prof["nintendo_swap"] = True
+        prof["trigger_bumper_swap"] = True
+
+        mfd, mev = _create_mock_uinput_pad()
+        try:
+            w = res_app.GamepadWorker({"vendor": "0079", "product": "0006", "name": "SwapTest", "dev_path": mev, "identifier": "test/swap"}, prof, 1, bridge_mode=True)
+            w.start()
+            for _ in range(40):
+                if w.vpad is not None:
+                    break
+                time.sleep(0.03)
+            self.assertIsNotNone(w.vpad)
+            # Physical code 290 is "a" -> with nintendo_swap moves to "b"
+            _emit(mfd, 1, 290, 1)
+            # Physical code 294 is "lt" -> with trigger_bumper_swap moves to "lb"
+            _emit(mfd, 1, 294, 1)
+            _emit(mfd, 0, 0, 0)
+            time.sleep(0.05)
+            self.assertTrue(w.live_state["buttons"]["b"])
+            self.assertFalse(w.live_state["buttons"]["a"])
+            self.assertTrue(w.live_state["buttons"]["lb"])
+            # Non-blocking test rumble pulse returns clean boolean without raising
+            ok, msg = w.trigger_test_rumble()
+            self.assertIsInstance(ok, bool)
+            self.assertIsInstance(msg, str)
+            time.sleep(0.05)
+            w.stop(wait=True)
+        finally:
+            fcntl.ioctl(mfd, UI_DEV_DESTROY)
+            os.close(mfd)
+
+    def test_cli_help_lists_lan_and_daemon(self):
+        import subprocess
+        out = subprocess.check_output([sys.executable, os.path.join(LINUX_DIR, "app.py"), "--help"], text=True, timeout=5)
+        self.assertIn("--lan", out)
+        self.assertIn("--daemon", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

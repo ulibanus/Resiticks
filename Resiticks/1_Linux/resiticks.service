@@ -1,0 +1,12 @@
+[Unit]
+Description=Resiticks — Hub Universal de Joysticks y Puente XInput
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/resiticks --daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
