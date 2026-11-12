@@ -547,5 +547,69 @@ class TestExtendedIntegration(unittest.TestCase):
             sock.close()
 
 
+class TestSecurityAndPerformance(unittest.TestCase):
+    def test_rejects_path_traversal_vendor_product(self):
+        for bad in ("../../etc", "../x", "zzzz", "123g", ""):
+            with self.assertRaises(ValueError):
+                evdev_utils.normalize_profile_data({"vendor": bad, "product": "0001", "mapping": {}})
+            with self.assertRaises(ValueError):
+                evdev_utils.delete_profile(bad, "0001")
+
+    def test_load_profiles_cache_and_mutation_isolation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            evdev_utils.save_profile(
+                {"vendor": "abcd", "product": "1234", "name": "Original", "mapping": {"a": {"type": "btn", "code": 290}}},
+                profiles_dir=tmpdir,
+            )
+            p1 = evdev_utils.load_profiles(tmpdir)
+            self.assertEqual(p1["abcd:1234"]["name"], "Original")
+            # Mutating returned dict must NOT corrupt cached snapshot
+            p1["abcd:1234"]["name"] = "MutatedInRam"
+            p2 = evdev_utils.load_profiles(tmpdir)
+            self.assertEqual(p2["abcd:1234"]["name"], "Original")
+            # Deleting must invalidate cache immediately
+            self.assertTrue(evdev_utils.delete_profile("abcd", "1234", profiles_dir=tmpdir))
+            self.assertEqual(evdev_utils.load_profiles(tmpdir), {})
+
+    def test_http_csrf_dns_rebinding_and_security_headers(self):
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), res_app.ResiticksHTTPHandler)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            # Security headers check & no wildcard CORS
+            with urllib.request.urlopen(base + "/api/status", timeout=3) as r:
+                self.assertEqual(r.headers.get("X-Content-Type-Options"), "nosniff")
+                self.assertEqual(r.headers.get("X-Frame-Options"), "DENY")
+                self.assertIsNone(r.headers.get("Access-Control-Allow-Origin"))
+
+            # Cross-origin POST CSRF must be blocked with 403
+            req = urllib.request.Request(
+                base + "/api/bridge/toggle",
+                data=b"{}",
+                headers={"Content-Type": "application/json", "Origin": "https://evil.example"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(req, timeout=3)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+
+            # DNS rebinding Host header must be blocked with 403
+            req_host = urllib.request.Request(
+                base + "/api/status",
+                headers={"Host": "attacker.example:8765"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx2:
+                urllib.request.urlopen(req_host, timeout=3)
+            self.assertEqual(ctx2.exception.code, 403)
+            ctx2.exception.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

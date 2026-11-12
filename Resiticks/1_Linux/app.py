@@ -12,6 +12,7 @@ import glob
 import io
 import json
 import os
+import re
 import select
 import shutil
 import signal
@@ -76,11 +77,17 @@ from virtual_xbox import (
     BTN_Y,
     EV_ABS,
     EV_KEY,
+    EV_SYN,
+    SYN_REPORT,
     VirtualXboxPad,
 )
 from web_ui import HTML_PAGE
 
 MAX_SLOTS = 8
+MAX_GITHUB_ARCHIVE_BYTES = 20 * 1024 * 1024
+MAX_PROFILE_JSON_BYTES = 256 * 1024
+PROFILE_FILENAME_RE = re.compile(r"^[0-9a-f]{4}_[0-9a-f]{4}\.json$")
+ALLOWED_LOCAL_HOSTNAMES = {"127.0.0.1", "localhost", "::1"}
 GITHUB_ARCHIVE_URL = "https://github.com/ulibanus/Resiticks/archive/refs/heads/main.tar.gz"
 
 
@@ -375,6 +382,7 @@ class GamepadWorker(threading.Thread):
             "lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0,
             "raw_lx": 0.0, "raw_ly": 0.0, "raw_rx": 0.0, "raw_ry": 0.0,
             "lt": 0, "rt": 0,
+            "polling_hz": 0,
             "buttons": {
                 "a": False, "b": False, "x": False, "y": False,
                 "lb": False, "rb": False, "lt": False, "rt": False,
@@ -383,6 +391,8 @@ class GamepadWorker(threading.Thread):
                 "dpup": False, "dpdown": False, "dpleft": False, "dpright": False,
             },
         }
+        self._syn_count = 0
+        self._hz_window_start = time.monotonic()
 
     def _compile_profile(self, profile):
         """Parse profile mapping, deadzone, center offsets, and rumble flag under _cfg_lock."""
@@ -713,6 +723,7 @@ class GamepadWorker(threading.Thread):
                     break
 
                 num_events = len(data) // EVENT_SIZE
+                saw_syn = False
                 for i in range(num_events):
                     ev = data[i * EVENT_SIZE : (i + 1) * EVENT_SIZE]
                     _, _, ev_type, code, value = struct.unpack(EVENT_FORMAT, ev)
@@ -720,6 +731,20 @@ class GamepadWorker(threading.Thread):
                         self._handle_key_event(code, value)
                     elif ev_type == EV_ABS:
                         self._handle_abs_event(code, value)
+                    elif ev_type == EV_SYN and code == SYN_REPORT:
+                        saw_syn = True
+                        self._syn_count += 1
+                        if self.vpad is not None:
+                            self.vpad.sync()
+
+                if not saw_syn:
+                    self._syn_count += 1
+                now_hz = time.monotonic()
+                elapsed_hz = now_hz - self._hz_window_start
+                if elapsed_hz >= 0.5:
+                    self.live_state["polling_hz"] = int(round(self._syn_count / elapsed_hz))
+                    self._syn_count = 0
+                    self._hz_window_start = now_hz
 
                 if self.vpad is not None:
                     self.vpad.sync()
@@ -906,27 +931,35 @@ def _update_from_github():
     # Archive download fallback works on ZIP installs and dirty git clones without losing local custom profiles
     req = urllib.request.Request(GITHUB_ARCHIVE_URL, headers={"User-Agent": "Resiticks-Updater"})
     with urllib.request.urlopen(req, timeout=20) as resp:
-        tar_bytes = resp.read()
+        tar_bytes = resp.read(MAX_GITHUB_ARCHIVE_BYTES + 1)
+    if len(tar_bytes) > MAX_GITHUB_ARCHIVE_BYTES:
+        raise ValueError("El archivo descargado de GitHub excede el límite seguro de 20 MB.")
 
     added = 0
-    updated = 0
     with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
         for member in tf.getmembers():
-            if not member.isfile():
+            if not member.isfile() or member.size <= 0 or member.size > MAX_PROFILE_JSON_BYTES:
                 continue
             parts = member.name.split("/")
-            # Expect Resiticks-main/Resiticks/profiles/*.json
-            if "profiles" in parts and parts[-1].endswith(".json"):
+            fname = parts[-1]
+            # Expect Resiticks-main/Resiticks/profiles/<4hex>_<4hex>.json
+            if "profiles" in parts and PROFILE_FILENAME_RE.fullmatch(fname):
                 idx = parts.index("profiles")
                 if idx == len(parts) - 2:
-                    raw = tf.extractfile(member).read()
-                    dest = os.path.join(profiles_dir, parts[-1])
+                    extracted = tf.extractfile(member)
+                    if extracted is None:
+                        continue
+                    raw = extracted.read(MAX_PROFILE_JSON_BYTES + 1)
+                    if len(raw) > MAX_PROFILE_JSON_BYTES:
+                        continue
+                    try:
+                        parsed = normalize_profile_data(json.loads(raw.decode("utf-8")))
+                    except Exception:
+                        continue
+                    dest = os.path.join(profiles_dir, f"{parsed['vendor']}_{parsed['product']}.json")
                     if not os.path.exists(dest):
-                        with open(dest, "wb") as f:
-                            f.write(raw)
+                        save_profile(parsed, profiles_dir=profiles_dir)
                         added += 1
-                    else:
-                        updated += 0  # Preserve local friend calibration unless new file
 
     with state.lock:
         state.profile_revision += 1
@@ -970,13 +1003,39 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _is_valid_local_origin(self, require_same_origin=False):
+        """Reject DNS rebinding (Host) and cross-origin browser CSRF (Origin/Referer)."""
+        host_hdr = self.headers.get("Host", "")
+        if host_hdr:
+            parsed_host = urllib.parse.urlsplit("//" + host_hdr).hostname or ""
+            if parsed_host.lower() not in ALLOWED_LOCAL_HOSTNAMES:
+                return False
+
+        if require_same_origin:
+            origin = self.headers.get("Origin")
+            if origin:
+                orig_host = (urllib.parse.urlsplit(origin).hostname or "").lower()
+                if orig_host not in ALLOWED_LOCAL_HOSTNAMES:
+                    return False
+            else:
+                referer = self.headers.get("Referer")
+                if referer:
+                    ref_host = (urllib.parse.urlsplit(referer).hostname or "").lower()
+                    if ref_host not in ALLOWED_LOCAL_HOSTNAMES:
+                        return False
+        return True
+
     def _send_bytes(self, status, content_type, data_bytes, extra_headers=None):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data_bytes)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'",
+        )
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
@@ -998,9 +1057,15 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8"))
 
     def do_OPTIONS(self):
+        if not self._is_valid_local_origin(require_same_origin=True):
+            self._send_json(403, {"error": "Origen no permitido"})
+            return
         self._send_bytes(204, "text/plain", b"")
 
     def do_GET(self):
+        if not self._is_valid_local_origin(require_same_origin=False):
+            self._send_json(403, {"error": "Host local inválido"})
+            return
         url = urllib.parse.urlparse(self.path)
         if url.path in ("/", "/index.html"):
             self._send_bytes(200, "text/html; charset=utf-8", HTML_PAGE.encode("utf-8"))
@@ -1067,6 +1132,9 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "Endpoint no encontrado"})
 
     def do_POST(self):
+        if not self._is_valid_local_origin(require_same_origin=True):
+            self._send_json(403, {"error": "Petición cross-origin bloqueada por seguridad"})
+            return
         url = urllib.parse.urlparse(self.path)
         try:
             body = self._read_json_body()
@@ -1192,7 +1260,11 @@ class ResiticksHTTPHandler(BaseHTTPRequestHandler):
         if url.path == "/api/profiles/delete":
             vendor = str(body.get("vendor", ""))
             product = str(body.get("product", ""))
-            deleted = delete_profile(vendor, product)
+            try:
+                deleted = delete_profile(vendor, product)
+            except ValueError as exc:
+                self._send_json(400, {"error": str(exc)})
+                return
             with state.lock:
                 state.profile_revision += 1
             state.supervisor_wakeup.set()

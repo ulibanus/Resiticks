@@ -89,6 +89,8 @@ class VirtualXboxPad:
         self.enable_rumble = bool(enable_rumble)
         self.fd = None
         self._ff_map = {}  # virtual effect id -> physical effect id
+        self._batch = bytearray()
+        self._last_values = {}  # (ev_type, code) -> last emitted value
 
         flags = (os.O_RDWR if self.enable_rumble else os.O_WRONLY) | os.O_NONBLOCK
         self.fd = os.open("/dev/uinput", flags)
@@ -142,24 +144,49 @@ class VirtualXboxPad:
         fcntl.ioctl(self.fd, UI_DEV_SETUP, setup_data)
         fcntl.ioctl(self.fd, UI_DEV_CREATE)
 
-    def emit(self, ev_type, code, value):
-        """Write an input_event packet to uinput, retrying briefly if non-blocking buffer is full."""
+    def _write_raw(self, payload):
+        """Write packed input_event bytes to uinput, retrying briefly if non-blocking buffer is full."""
         fd = self.fd
-        if fd is None:
+        if fd is None or not payload:
             return
-        data = struct.pack(EVENT_FORMAT, 0, 0, ev_type, code, value)
-        for _ in range(3):
-            try:
-                os.write(fd, data)
-                return
-            except BlockingIOError:
-                time.sleep(0.0005)
-            except OSError:
+        view = memoryview(payload)
+        offset = 0
+        while offset < len(view):
+            wrote = False
+            for _ in range(4):
+                try:
+                    n = os.write(fd, view[offset:])
+                    offset += n
+                    wrote = True
+                    break
+                except BlockingIOError:
+                    time.sleep(0.0005)
+                except OSError:
+                    return
+            if not wrote:
                 return
 
+    def emit(self, ev_type, code, value):
+        """Queue a changed EV_KEY/EV_ABS event (or flush on EV_SYN) to reduce syscalls and noise."""
+        if self.fd is None:
+            return
+        if ev_type == EV_SYN:
+            self.sync()
+            return
+        key = (ev_type, code)
+        if self._last_values.get(key) == value:
+            return
+        self._last_values[key] = value
+        self._batch.extend(struct.pack(EVENT_FORMAT, 0, 0, ev_type, code, value))
+
     def sync(self):
-        """Emit SYN_REPORT to commit queued events."""
-        self.emit(EV_SYN, SYN_REPORT, 0)
+        """Commit queued events with SYN_REPORT in a single syscall; no-op when queue is empty."""
+        if self.fd is None or not self._batch:
+            return
+        self._batch.extend(struct.pack(EVENT_FORMAT, 0, 0, EV_SYN, SYN_REPORT, 0))
+        payload = bytes(self._batch)
+        self._batch.clear()
+        self._write_raw(payload)
 
     def emit_key(self, code, is_pressed):
         """Emit a digital key event."""

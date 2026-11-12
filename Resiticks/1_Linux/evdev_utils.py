@@ -7,12 +7,18 @@ import sys
 import glob
 import json
 import re
+import copy
+import threading
 import fcntl
 import struct
 import shutil
 import subprocess
 import grp
 import pwd
+
+HEX4_RE = re.compile(r"^[0-9a-f]{4}$")
+_PROFILES_CACHE_LOCK = threading.Lock()
+_PROFILES_CACHE = {}  # realpath(pdir) -> (dir_sig, parsed_dict)
 
 EVENT_FORMAT = "qqHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
@@ -111,6 +117,28 @@ def save_config(cfg):
     os.replace(tmp_path, cfg_path)
 
 
+def _validate_hex_id(value, label="id"):
+    """Validate and normalize a 1..4-digit USB/BT vendor or product hex identifier."""
+    if value is None:
+        raise ValueError(f"{label} inválido: None")
+    raw = str(value).strip().lower()
+    if not raw or len(raw) > 4:
+        raise ValueError(f"{label} inválido (se esperan 1..4 dígitos hexadecimales): {value!r}")
+    norm = raw.zfill(4)
+    if not HEX4_RE.fullmatch(norm):
+        raise ValueError(f"{label} inválido (se esperan dígitos hexadecimales): {value!r}")
+    return norm
+
+
+def invalidate_profiles_cache(profiles_dir=None):
+    """Clear cached profile snapshots so next load_profiles() re-reads disk."""
+    with _PROFILES_CACHE_LOCK:
+        if profiles_dir is None:
+            _PROFILES_CACHE.clear()
+        else:
+            _PROFILES_CACHE.pop(os.path.realpath(profiles_dir), None)
+
+
 def normalize_profile_data(data, filepath=None):
     """Validate and apply non-destructive defaults to a loaded controller profile."""
     if not isinstance(data, dict):
@@ -120,8 +148,8 @@ def normalize_profile_data(data, filepath=None):
     if not isinstance(data["mapping"], dict):
         raise ValueError("El campo mapping debe ser un diccionario")
 
-    vendor = str(data["vendor"]).strip().lower().zfill(4)
-    product = str(data["product"]).strip().lower().zfill(4)
+    vendor = _validate_hex_id(data["vendor"], "vendor")
+    product = _validate_hex_id(data["product"], "product")
     data["vendor"] = vendor
     data["product"] = product
     data.setdefault("name", f"Mando {vendor}:{product}")
@@ -134,11 +162,30 @@ def normalize_profile_data(data, filepath=None):
     return data
 
 
-def load_profiles(profiles_dir=None):
-    """Load all valid JSON controller profiles, logging corrupt ones cleanly."""
-    pdir = profiles_dir or resolve_profiles_dir()
-    profiles = {}
+def _compute_profiles_dir_sig(pdir):
+    """Build lightweight (filename, mtime_ns, size) signature to avoid redundant JSON parses."""
+    sig = []
     for p in sorted(glob.glob(os.path.join(pdir, "*.json"))):
+        try:
+            st = os.stat(p)
+            sig.append((p, st.st_mtime_ns, st.st_size))
+        except OSError:
+            continue
+    return tuple(sig)
+
+
+def load_profiles(profiles_dir=None):
+    """Load all valid JSON controller profiles using mtime caching and deep-copied outputs."""
+    pdir = os.path.realpath(profiles_dir or resolve_profiles_dir())
+    sig = _compute_profiles_dir_sig(pdir)
+
+    with _PROFILES_CACHE_LOCK:
+        cached = _PROFILES_CACHE.get(pdir)
+        if cached and cached[0] == sig:
+            return {k: copy.deepcopy(v) for k, v in cached[1].items()}
+
+    profiles = {}
+    for p, _, _ in sig:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -147,7 +194,10 @@ def load_profiles(profiles_dir=None):
             profiles[key] = norm
         except Exception as e:
             print(f"[Perfiles] Ignorando archivo inválido {os.path.basename(p)}: {e}", file=sys.stderr)
-    return profiles
+
+    with _PROFILES_CACHE_LOCK:
+        _PROFILES_CACHE[pdir] = (sig, profiles)
+    return {k: copy.deepcopy(v) for k, v in profiles.items()}
 
 
 def save_profile(profile_data, profiles_dir=None):
@@ -163,17 +213,19 @@ def save_profile(profile_data, profiles_dir=None):
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(norm_clean, f, indent=2, ensure_ascii=False)
     os.replace(tmp_path, out_path)
+    invalidate_profiles_cache(pdir)
     return out_path
 
 
 def delete_profile(vendor, product, profiles_dir=None):
-    """Remove a profile JSON file by VID:PID if present."""
+    """Remove a profile JSON file by validated VID:PID if present."""
     pdir = profiles_dir or resolve_profiles_dir()
-    v = str(vendor).strip().lower().zfill(4)
-    p = str(product).strip().lower().zfill(4)
+    v = _validate_hex_id(vendor, "vendor")
+    p = _validate_hex_id(product, "product")
     target = os.path.join(pdir, f"{v}_{p}.json")
     if os.path.exists(target):
         os.remove(target)
+        invalidate_profiles_cache(pdir)
         return True
     return False
 

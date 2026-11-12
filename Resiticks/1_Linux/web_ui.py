@@ -299,7 +299,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <div class="section-bar">
       <span class="section-title">Slots Principales (1–4)</span>
       <div class="mini-metrics">
-        <span>Polling: <b>125 Hz</b></span>
+        <span>Polling: <b id="metrics-polling-hz">-- Hz</b></span>
         <span>Latencia: <b>&lt;1 ms</b></span>
         <span>Motor: <b id="metrics-vpad-count">0 Activos</b></span>
       </div>
@@ -812,7 +812,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       uncalBanner.className = 'alert-banner warn';
       uncalBanner.innerHTML = '<span>🔌 <strong>Mando nuevo detectado sin perfil calibrado:</strong> ' +
         uncal.map(gp => `${escapeHtml(gp.name)} (${escapeHtml(gp.vendor)}:${escapeHtml(gp.product)})`).join(', ') + '</span>' +
-        `<button class="btn" style="background:#f59e0b;color:#0b1120;padding:4px 10px;font-size:11px;" onclick="startWebCalibration('${escapeHtml(uncal[0].dev_path)}', '${escapeHtml(uncal[0].name)}')">⚡ Calibrar Ahora</button>`;
+        `<button class="btn" style="background:#f59e0b;color:#0b1120;padding:4px 10px;font-size:11px;" data-dev="${escapeHtml(uncal[0].dev_path)}" data-name="${escapeHtml(uncal[0].name)}" onclick="startWebCalibration(this.dataset.dev, this.dataset.name)">⚡ Calibrar Ahora</button>`;
     } else {
       uncalBanner.className = 'alert-banner';
       uncalBanner.innerHTML = '';
@@ -820,6 +820,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
 
   async function updateDashboard() {
+    if (document.hidden) return;
     try {
       const res = await fetch('/api/status');
       if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -832,10 +833,17 @@ HTML_PAGE = r"""<!DOCTYPE html>
       renderBanners(data);
 
       let activeCount = 0;
+      let maxHz = 0;
       for (let s = 1; s <= 8; s++) {
-        if (data.active_slots[String(s)] || data.active_slots[s]) activeCount++;
+        if (data.active_slots[String(s)] || data.active_slots[s]) {
+          activeCount++;
+          const inp = data.live_inputs[String(s)] || data.live_inputs[s];
+          if (inp && inp.polling_hz > maxHz) maxHz = inp.polling_hz;
+        }
       }
       document.getElementById('metrics-vpad-count').textContent = `${activeCount} Activo${activeCount === 1 ? '' : 's'}`;
+      const hzEl = document.getElementById('metrics-polling-hz');
+      if (hzEl) hzEl.textContent = maxHz > 0 ? `${maxHz} Hz` : (activeCount > 0 ? 'Reposo' : '-- Hz');
 
       if (data.profile_revision !== lastProfilesRev) {
         lastProfilesRev = data.profile_revision;
@@ -1168,6 +1176,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     try { await fetch('/api/calibrate/web/cancel', { method: 'POST' }); } catch (e) {}
   }
 
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) updateDashboard();
+  });
   setInterval(updateDashboard, 90);
   updateDashboard();
   loadProfilesList();
