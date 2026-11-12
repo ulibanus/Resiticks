@@ -1,185 +1,122 @@
 #!/usr/bin/env python3
+"""
+Resiticks CLI calibrator following Konami PES Settings 2-column order.
+Coordinates gracefully with a running app.py server without killing it.
+"""
 import os
 import sys
-import re
-import json
-import struct
 import select
+import struct
 import time
-import fcntl
+import urllib.request
+import json
 
-# Linux input_event 64-bit
-EVENT_FORMAT = "qqHHi"
-EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
+from evdev_utils import (
+    get_abs_info,
+    get_connected_gamepads,
+    resolve_profiles_dir,
+    save_profile,
+)
+from calibration_core import (
+    CALIBRATION_STEPS,
+    EVENT_FORMAT,
+    EVENT_SIZE,
+    derive_canonical_axes,
+    detect_digital_mode_warning,
+    detect_input_event,
+    drain_and_wait_neutral,
+    validate_calibration_consistency,
+)
 
-EV_SYN = 0x00
-EV_KEY = 0x01
-EV_REL = 0x02
-EV_ABS = 0x03
 
-ABS_HAT0X = 16
-ABS_HAT0Y = 17
-
-def get_abs_info(fd):
-    info = {}
-    for axis in range(64):
-        try:
-            buf = bytearray(24)
-            fcntl.ioctl(fd, 0x80184540 + axis, buf)
-            val, minimum, maximum, fuzz, flat, res = struct.unpack("iiiiii", buf)
-            info[axis] = {"val": val, "min": minimum, "max": maximum}
-        except OSError:
-            pass
-    return info
-
-def get_connected_gamepads():
-    gamepads = []
+def _notify_server_pause(dev_path, action="pause"):
+    """Politely ask running Resiticks web server to release/reclaim one device without killing app.py."""
+    url = f"http://127.0.0.1:8765/api/calibrate/{action}"
+    payload = json.dumps({"dev_path": dev_path}).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload, headers={"Content-Type": "application/json"}, method="POST"
+    )
     try:
-        with open("/proc/bus/input/devices", "r") as f:
-            content = f.read()
-    except Exception as e:
-        print(f"Error leyendo /proc/bus/input/devices: {e}")
-        return []
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
 
-    entries = content.strip().split("\n\n")
-    for entry in entries:
-        lines = entry.split("\n")
-        info = {}
-        for line in lines:
-            if line.startswith("I:"):
-                m = re.search(r"Vendor=([0-9a-fA-F]+)\s+Product=([0-9a-fA-F]+)", line)
-                if m:
-                    info["vendor"] = m.group(1).lower()
-                    info["product"] = m.group(2).lower()
-            elif line.startswith("N:"):
-                m = re.search(r'Name="([^"]+)"', line)
-                if m:
-                    info["name"] = m.group(1)
-            elif line.startswith("S:"):
-                m = re.search(r"Sysfs=(.*)", line)
-                if m:
-                    info["sysfs"] = m.group(1)
-            elif line.startswith("H:"):
-                m = re.search(r"Handlers=(.*)", line)
-                if m:
-                    handlers = m.group(1).split()
-                    for h in handlers:
-                        if h.startswith("event"):
-                            info["event"] = h
-                        if h.startswith("js"):
-                            info["js"] = h
 
-        name = info.get("name", "")
-        if "Motion Sensors" in name or "Resiticks" in name or "(IMU)" in name or "Touchpad" in name or "Mouse" in name:
-            continue
-        if "virtual" in info.get("sysfs", ""):
-            continue
+def choose_gamepad(gamepads):
+    """Prompt user with strict input validation until a valid gamepad index is selected."""
+    if len(gamepads) == 1:
+        print(f"\nSeleccionado automáticamente el joystick 1: {gamepads[0]['name']}")
+        return gamepads[0]
 
-        if "event" in info and ("js" in info or "Gamepad" in name or "Joystick" in name or "Controller" in name or "pad" in name):
-            info["dev_path"] = f"/dev/input/{info['event']}"
-            gamepads.append(info)
-
-    return gamepads
-
-def wait_for_release(fd, abs_info):
-    """Espera a que el usuario suelte botones y vuelva los ejes al centro"""
-    time.sleep(0.12)
     while True:
-        r, _, _ = select.select([fd], [], [], 0.05)
-        if not r:
-            break
         try:
-            os.read(fd, EVENT_SIZE * 64)
-        except:
-            break
+            ans = input(f"\nElegí el número de joystick a calibrar (1-{len(gamepads)}): ").strip()
+            idx = int(ans) - 1
+            if 0 <= idx < len(gamepads):
+                return gamepads[idx]
+        except ValueError:
+            pass
+        print(f"⚠️  Ingresá un número válido entre 1 y {len(gamepads)}.")
 
-def wait_for_input(fd, prompt, abs_info, allow_skip=True):
-    print(f"\n👉 {prompt}")
-    if allow_skip:
-        print("   (Presioná [ENTER] en el teclado para saltear)")
 
-    wait_for_release(fd, abs_info)
+def wait_for_step_input(fd, step, abs_info):
+    """Wait for a single input matching a calibration step, warning on Digital Mode."""
+    prompt = step["prompt"]
+    allow_skip = step["allow_skip"]
+    step_key = step["key"]
 
     while True:
-        r, _, _ = select.select([sys.stdin, fd], [], [])
-        if sys.stdin in r:
-            sys.stdin.readline()
-            if allow_skip:
-                print("   ⏩ Salteado.")
-                return None
+        print(f"\n👉 {prompt}")
+        if allow_skip:
+            print("   (Presioná [ENTER] en el teclado para saltear)")
 
-        if fd in r:
-            try:
-                data = os.read(fd, EVENT_SIZE)
-            except OSError:
+        drain_and_wait_neutral(fd, abs_info)
+        detected = None
+
+        while detected is None:
+            r, _, _ = select.select([sys.stdin, fd], [], [])
+            if sys.stdin in r:
+                sys.stdin.readline()
+                if allow_skip:
+                    print("   ⏩ Salteado.")
+                    return None
+                print("   ⚠️  Este botón es obligatorio en PES. Presionalo en el joystick.")
                 continue
 
-            if len(data) < EVENT_SIZE:
+            if fd in r:
+                try:
+                    data = os.read(fd, EVENT_SIZE)
+                except OSError:
+                    continue
+                if len(data) < EVENT_SIZE:
+                    continue
+                _, _, ev_type, code, value = struct.unpack(EVENT_FORMAT, data)
+                detected = detect_input_event(ev_type, code, value, abs_info)
+
+        warn = detect_digital_mode_warning(step_key, detected)
+        if warn:
+            print(f"\n⚠️  {warn}")
+            retry = input("   Presioná [ENTER] para repetir este paso (o 's' + ENTER para conservarlo igual): ").strip().lower()
+            if retry != "s":
                 continue
 
-            tv_sec, tv_usec, ev_type, code, value = struct.unpack(EVENT_FORMAT, data)
+        t = detected.get("type")
+        if t == "btn":
+            print(f"   ✅ Detectado Botón: Código {detected['code']} (0x{detected['code']:03x})")
+        elif t == "hat":
+            print(f"   ✅ Detectado D-Pad HAT: Eje {detected['code']}, Valor {detected['value']}")
+        else:
+            print(f"   ✅ Detectado Eje Analógico: Código {detected['code']}, Dir {detected.get('direction', 1)} (Valor {detected.get('value')})")
 
-            # Botón normal
-            if ev_type == EV_KEY and value == 1:
-                print(f"   ✅ Detectado Botón: Código {code} (0x{code:03x})")
-                wait_for_release(fd, abs_info)
-                return {"type": "btn", "code": code}
+        drain_and_wait_neutral(fd, abs_info)
+        return detected
 
-            # Eje D-Pad tipo HAT (flechas)
-            elif ev_type == EV_ABS and code in (ABS_HAT0X, ABS_HAT0Y):
-                if value != 0:
-                    axis_name = "HAT Y (Vertical)" if code == ABS_HAT0Y else "HAT X (Horizontal)"
-                    dir_name = "-1 (Arriba/Izq)" if value < 0 else "+1 (Abajo/Der)"
-                    print(f"   ✅ Detectado D-Pad: {axis_name}, Dirección {dir_name}")
-                    wait_for_release(fd, abs_info)
-                    return {"type": "hat", "code": code, "value": value}
-
-            # Ejes analógicos estándar (sticks o gatillos analógicos)
-            elif ev_type == EV_ABS and code not in (ABS_HAT0X, ABS_HAT0Y):
-                info = abs_info.get(code, {"min": 0, "max": 255, "val": 0})
-                val_min = info.get("min", 0)
-                val_max = info.get("max", 255)
-                rest_val = info.get("val", 0)
-
-                # Caso 1: Gatillos analógicos (L2/R2 tipo Xbox/PS3, rango 0..255 descansando en 0)
-                if val_min == 0 and val_max <= 255 and rest_val < 35:
-                    if value > 120:
-                        print(f"   ✅ Detectado Gatillo Analógico: Código {code} (Valor: {value})")
-                        wait_for_release(fd, abs_info)
-                        return {"type": "axis", "code": code, "direction": 1, "value": value, "is_trigger": True}
-
-                # Caso 2: Sticks Xbox con rango de 16 bits (-32768 a 32767, centrados en 0)
-                elif val_min < -1000:
-                    if abs(value) > 16000:
-                        direction = 1 if value > 0 else -1
-                        print(f"   ✅ Detectado Stick Analógico (Xbox): Código {code}, Dirección: {direction} (Valor: {value})")
-                        wait_for_release(fd, abs_info)
-                        return {"type": "axis", "code": code, "direction": direction, "value": value}
-
-                # Caso 3: Sticks genéricos con rango de 8 bits (0 a 255, centrados en ~128)
-                else:
-                    mid = (val_min + val_max) / 2.0
-                    span = (val_max - val_min) / 2.0
-                    if span > 0:
-                        deviation = (value - mid) / span
-                        if abs(deviation) > 0.45:
-                            direction = 1 if deviation > 0 else -1
-                            print(f"   ✅ Detectado Stick Analógico (Genérico): Código {code}, Dirección: {direction} (Valor: {value})")
-                            wait_for_release(fd, abs_info)
-                            return {"type": "axis", "code": code, "direction": direction, "value": value}
 
 def main():
-    # Asegurar que ningún puente en segundo plano retenga el bloqueo exclusivo EVIOCGRAB
-    try:
-        import subprocess
-        subprocess.run(["pkill", "-f", "joybridge/app.py"], stderr=subprocess.DEVNULL)
-        subprocess.run(["pkill", "-f", "joybridge/bridge.py"], stderr=subprocess.DEVNULL)
-        time.sleep(0.3)
-    except Exception:
-        pass
-
+    """Run interactive CLI calibration wizard in Konami PES Settings order."""
     print("=" * 65)
-    print(" 🎮 JoyBridge - Calibrador con Orden Oficial PES (Settings)")
+    print(" 🎮 Resiticks - Calibrador Oficial por Consola (Orden PES)")
     print("=" * 65)
 
     gamepads = get_connected_gamepads()
@@ -191,111 +128,71 @@ def main():
     for i, gp in enumerate(gamepads):
         print(f" [{i+1}] {gp.get('name')} (VID: {gp.get('vendor')}, PID: {gp.get('product')}) en {gp.get('dev_path')}")
 
-    if len(gamepads) == 1:
-        choice = 0
-        print(f"\nSeleccionado automáticamente el joystick 1: {gamepads[0]['name']}")
-    else:
-        ans = input(f"\nElegí el número de joystick a calibrar (1-{len(gamepads)}): ")
-        choice = int(ans.strip()) - 1
-
-    selected = gamepads[choice]
+    selected = choose_gamepad(gamepads)
     dev_path = selected["dev_path"]
+    paused_server = _notify_server_pause(dev_path, "pause")
+    if paused_server:
+        print(f"ℹ️  Servidor Resiticks activo detectado: liberando temporalmente {dev_path}...")
+        time.sleep(0.25)
 
+    fd = None
     try:
-        fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
-    except PermissionError:
-        print(f"❌ Error de permisos al abrir {dev_path}.")
-        sys.exit(1)
+        try:
+            fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+        except PermissionError:
+            print(f"❌ Error de permisos al abrir {dev_path}. Verificá pertenecer al grupo 'input'.")
+            sys.exit(1)
 
-    abs_info = get_abs_info(fd)
+        abs_info = get_abs_info(fd)
+        print("\n" + "=" * 65)
+        print("📋 CALIBRACIÓN SIGUIENDO EL ORDEN EXACTO DE PES SETTINGS:")
+        print("   Primero la columna izquierda completa, luego la columna derecha.")
+        print("   Tip: en joysticks con botón ANALOG, verificá que el LED rojo esté encendido.")
+        print("=" * 65)
 
-    print("\n" + "=" * 65)
-    print("📋 CALIBRACIÓN SIGUIENDO EL ORDEN EXACTO DE PES SETTINGS:")
-    print("   Primero la columna izquierda completa, luego la columna derecha.")
-    print("=" * 65)
+        mapping = {}
+        for step in CALIBRATION_STEPS:
+            res = wait_for_step_input(fd, step, abs_info)
+            if res is not None:
+                mapping[step["key"]] = res
 
-    mapping = {}
+        mapping = derive_canonical_axes(mapping)
+        warnings = validate_calibration_consistency(mapping)
+        if warnings:
+            print("\n⚠️  Advertencias detectadas en la calibración:")
+            for w in warnings:
+                print(f"   • {w}")
 
-    steps = [
-        # --- COLUMNA IZQUIERDA (PES SETTINGS) ---
-        ("lt", "1. [Lado Izq] Presioná Gatillo L2", True),
-        ("lb", "2. [Lado Izq] Presioná Botón L1", False),
-        
-        ("dpup", "3. [Lado Izq] D-Pad: Flecha ARRIBA (Hat Switch N)", False),
-        ("dpleft", "4. [Lado Izq] D-Pad: Flecha IZQUIERDA (Hat Switch W)", False),
-        ("dpdown", "5. [Lado Izq] D-Pad: Flecha ABAJO (Hat Switch S)", False),
-        ("dpright", "6. [Lado Izq] D-Pad: Flecha DERECHA (Hat Switch E)", False),
+        hw_name = selected.get("name", "Unknown Gamepad")
+        print("\n" + "-" * 65)
+        custom_name = input(f"¿Qué nombre querés ponerle a este joystick? [{hw_name}]: ").strip()
+        if not custom_name:
+            custom_name = hw_name
 
-        ("left_up", "7. [Lado Izq] Stick Izquierdo: Mové hacia ARRIBA (Y Axis -)", True),
-        ("left_left", "8. [Lado Izq] Stick Izquierdo: Mové hacia IZQUIERDA (X Axis -)", True),
-        ("left_down", "9. [Lado Izq] Stick Izquierdo: Mové hacia ABAJO (Y Axis +)", True),
-        ("left_right", "10. [Lado Izq] Stick Izquierdo: Mové hacia DERECHA (X Axis +)", True),
+        vendor = selected.get("vendor", "0000")
+        product = selected.get("product", "0000")
+        profile_data = {
+            "name": custom_name,
+            "hardware_name": hw_name,
+            "vendor": vendor,
+            "product": product,
+            "mapping": mapping,
+        }
 
-        ("thumbl", "11. [Lado Izq] Click Stick Izquierdo (L3)", True),
-        ("back", "12. [Lado Izq] Botón SELECT", False),
+        out_file = save_profile(profile_data, profiles_dir=resolve_profiles_dir())
+        print("\n" + "=" * 65)
+        print(" 🎉 ¡Calibración completada con éxito al estilo PES Settings!")
+        print(f" 💾 Perfil guardado en: {out_file}")
+        print("=" * 65)
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if paused_server:
+            _notify_server_pause(dev_path, "resume")
 
-        # --- COLUMNA DERECHA (PES SETTINGS) ---
-        ("rt", "13. [Lado Der] Presioná Gatillo R2", True),
-        ("rb", "14. [Lado Der] Presioná Botón R1", False),
-
-        ("y", "15. [Lado Der] Botón TRIÁNGULO / Y (Superior)", False),
-        ("x", "16. [Lado Der] Botón CUADRADO / X (Izquierdo)", False),
-        ("a", "17. [Lado Der] Botón CRUZ / A (Inferior)", False),
-        ("b", "18. [Lado Der] Botón CÍRCULO / B (Derecho)", False),
-
-        ("right_up", "19. [Lado Der] Stick Derecho: Mové hacia ARRIBA", True),
-        ("right_left", "20. [Lado Der] Stick Derecho: Mové hacia IZQUIERDA", True),
-        ("right_down", "21. [Lado Der] Stick Derecho: Mové hacia ABAJO", True),
-        ("right_right", "22. [Lado Der] Stick Derecho: Mové hacia DERECHA", True),
-
-        ("thumbr", "23. [Lado Der] Click Stick Derecho (R3)", True),
-        ("start", "24. [Lado Der] Botón START", False),
-    ]
-
-    for key, prompt, allow_skip in steps:
-        res = wait_for_input(fd, prompt, abs_info, allow_skip)
-        if res is not None:
-            mapping[key] = res
-
-    os.close(fd)
-
-    # Derivar configuraciones canónicas de ejes X/Y para los sticks si se calibraron las 4 direcciones
-    # Stick Izquierdo
-    if "left_right" in mapping:
-        mapping["leftx"] = {"type": "axis", "code": mapping["left_right"]["code"], "direction": 1}
-    if "left_down" in mapping:
-        mapping["lefty"] = {"type": "axis", "code": mapping["left_down"]["code"], "direction": 1}
-
-    # Stick Derecho
-    if "right_right" in mapping:
-        mapping["rightx"] = {"type": "axis", "code": mapping["right_right"]["code"], "direction": 1}
-    if "right_down" in mapping:
-        mapping["righty"] = {"type": "axis", "code": mapping["right_down"]["code"], "direction": 1}
-
-    hw_name = selected.get("name", "Unknown Gamepad")
-    print("\n" + "-" * 65)
-    custom_name = input(f"¿Qué nombre querés ponerle a este joystick? [{hw_name}]: ").strip()
-    if not custom_name:
-        custom_name = hw_name
-
-    vendor = selected.get("vendor", "0000")
-    product = selected.get("product", "0000")
-    profile_data = {
-        "name": custom_name,
-        "hardware_name": hw_name,
-        "vendor": vendor,
-        "product": product,
-        "mapping": mapping
-    }
-
-    out_file = f"/home/ulises/joybridge/profiles/{vendor}_{product}.json"
-    with open(out_file, "w") as f:
-        json.dump(profile_data, f, indent=2)
-
-    print("\n" + "=" * 65)
-    print(" 🎉 ¡Calibración completada con éxito al estilo PES Settings!")
-    print(f" 💾 Perfil actualizado en: {out_file}")
-    print("=" * 65)
 
 if __name__ == "__main__":
     main()

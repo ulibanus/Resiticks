@@ -1,219 +1,712 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
-import time
-import glob
-import re
+"""
+Resiticks — Universal Multi-Player Gamepad Hub & Xbox 360 Bridge (Linux).
+Manages up to 8 virtual Xbox 360 controllers via /dev/uinput with EVIOCGRAB,
+anti-drift tuning, live web calibration, rumble passthrough, and slot management.
+"""
+import argparse
+import copy
+import errno
 import fcntl
-import struct
-import threading
-import select
-import zipfile
+import glob
 import io
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import urllib.parse
+import json
+import os
+import select
+import shutil
+import signal
+import socket
+import struct
 import subprocess
+import sys
+import tarfile
+import threading
+import time
+import urllib.parse
+import urllib.request
+import zipfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from virtual_xbox import (
-    VirtualXboxPad,
-    BTN_A, BTN_B, BTN_X, BTN_Y,
-    BTN_TL, BTN_TR, BTN_SELECT, BTN_START, BTN_MODE, BTN_THUMBL, BTN_THUMBR,
-    ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT0X, ABS_HAT0Y,
-    EV_KEY, EV_ABS
+from calibration_core import (
+    CALIBRATION_STEPS,
+    derive_canonical_axes,
+    detect_digital_mode_warning,
+    detect_input_event,
+    is_axis_at_rest,
+    validate_calibration_consistency,
 )
+from evdev_utils import (
+    EVIOCGRAB,
+    EVENT_FORMAT,
+    EVENT_SIZE,
+    delete_profile,
+    detect_terminal_cmd,
+    diagnose_system,
+    get_abs_info,
+    get_connected_gamepads,
+    get_ff_support,
+    launch_browser_url,
+    load_config,
+    load_profiles,
+    normalize_profile_data,
+    resolve_app_root,
+    resolve_profiles_dir,
+    save_config,
+    save_profile,
+)
+from virtual_xbox import (
+    ABS_HAT0X,
+    ABS_HAT0Y,
+    ABS_RX,
+    ABS_RY,
+    ABS_X,
+    ABS_Y,
+    ABS_Z,
+    ABS_RZ,
+    BTN_A,
+    BTN_B,
+    BTN_MODE,
+    BTN_SELECT,
+    BTN_START,
+    BTN_THUMBL,
+    BTN_THUMBR,
+    BTN_TL,
+    BTN_TR,
+    BTN_X,
+    BTN_Y,
+    EV_ABS,
+    EV_KEY,
+    VirtualXboxPad,
+)
+from web_ui import HTML_PAGE
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
-os.makedirs(PROFILES_DIR, exist_ok=True)
+MAX_SLOTS = 8
+GITHUB_ARCHIVE_URL = "https://github.com/ulibanus/Resiticks/archive/refs/heads/main.tar.gz"
 
-EVENT_FORMAT = "qqHHi"
-EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
-EVIOCGRAB = 0x40044590
-
-MAX_SLOTS = 8 # Soporte extendido para hasta 8 jugadores (PES 6, torneos)
 
 class ResiticksState:
+    """Thread-safe central state shared between supervisor, workers, and HTTP handlers."""
+
     def __init__(self):
-        self.bridge_enabled = True
-        self.active_slots = {i: None for i in range(1, MAX_SLOTS + 1)}
-        self.connected_devices = []
-        self.workers = {}
-        self.live_inputs = {i: {} for i in range(1, MAX_SLOTS + 1)}
+        cfg = load_config()
         self.lock = threading.Lock()
+        self.supervisor_wakeup = threading.Event()
+        self.shutdown_event = threading.Event()
+        self.bridge_enabled = bool(cfg.get("bridge_enabled", True))
+        self.slot_pins = dict(cfg.get("slot_pins", {}))
+        self.slot_overrides = {}  # identifier -> forced slot 1..8
+        self.active_slots = {i: None for i in range(1, MAX_SLOTS + 1)}
+        self.live_inputs = {i: {} for i in range(1, MAX_SLOTS + 1)}
+        self.connected_devices = []
+        self.device_errors = {}
+        self.paused_devices = set()  # dev_path or identifier paused for calibration
+        self.workers = {}  # identifier -> GamepadWorker
+        self.profile_revision = 0
+        self.cal_launch_proc = None
+
 
 state = ResiticksState()
 
-def load_profiles():
-    profiles = {}
-    for p in glob.glob(os.path.join(PROFILES_DIR, "*.json")):
+
+class CalibrationSession:
+    """Interactive non-blocking Web UI calibration session for a single physical gamepad."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.active = False
+        self.dev_info = None
+        self.fd = None
+        self.abs_info = {}
+        self.step_idx = 0
+        self.mapping = {}
+        self.waiting_neutral = False
+        self.live_abs = {}
+        self.held_keys = set()
+        self.pending_warning = None
+        self.pending_detected = None
+
+    def start(self, dev_path):
+        """Pause any active worker on dev_path and open raw evdev for calibration."""
+        self.cancel()
+        connected = get_connected_gamepads()
+        dev_info = next((g for g in connected if g["dev_path"] == dev_path), None)
+        if not dev_info:
+            raise FileNotFoundError(f"Dispositivo no encontrado: {dev_path}")
+
+        ident = dev_info["identifier"]
+        with state.lock:
+            state.paused_devices.add(dev_path)
+            state.paused_devices.add(ident)
+            existing = state.workers.pop(ident, None)
+        state.supervisor_wakeup.set()
+
+        if existing is not None:
+            existing.stop(wait=True)
+        time.sleep(0.12)
+
         try:
-            with open(p, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                key = f"{data['vendor']}:{data['product']}".lower()
-                profiles[key] = data
-        except Exception:
-            pass
-    return profiles
+            fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+        except PermissionError as exc:
+            with state.lock:
+                state.paused_devices.discard(dev_path)
+                state.paused_devices.discard(ident)
+            state.supervisor_wakeup.set()
+            raise PermissionError(
+                f"Sin permiso para leer {dev_path}. Verificá pertenecer al grupo 'input'."
+            ) from exc
 
-def get_abs_info(fd):
-    info = {}
-    for axis in range(64):
-        try:
-            buf = bytearray(24)
-            fcntl.ioctl(fd, 0x80184540 + axis, buf)
-            val, minimum, maximum, fuzz, flat, res = struct.unpack("iiiiii", buf)
-            info[axis] = {"min": minimum, "max": maximum, "val": val}
-        except OSError:
-            pass
-    return info
+        abs_info = get_abs_info(fd)
+        with self.lock:
+            self.active = True
+            self.dev_info = dev_info
+            self.fd = fd
+            self.abs_info = abs_info
+            self.step_idx = 0
+            self.mapping = {}
+            self.waiting_neutral = True
+            self.live_abs = {c: v.get("val", 0) for c, v in abs_info.items()}
+            self.held_keys = set()
+            self.pending_warning = None
+            self.pending_detected = None
+            return self.snapshot_locked()
 
-def get_connected_gamepads():
-    gamepads = []
-    try:
-        with open("/proc/bus/input/devices", "r") as f:
-            content = f.read()
-    except Exception:
-        return []
+    def _drain_fd_locked(self):
+        """Read pending raw events non-blockingly and return newly read event tuples."""
+        events = []
+        if self.fd is None:
+            return events
+        while True:
+            try:
+                raw = os.read(self.fd, EVENT_SIZE * 32)
+                if not raw:
+                    break
+                n = len(raw) // EVENT_SIZE
+                for i in range(n):
+                    _, _, ev_t, code, val = struct.unpack(
+                        EVENT_FORMAT, raw[i * EVENT_SIZE : (i + 1) * EVENT_SIZE]
+                    )
+                    if ev_t == EV_KEY:
+                        if val == 0:
+                            self.held_keys.discard(code)
+                        else:
+                            self.held_keys.add(code)
+                    elif ev_t == EV_ABS:
+                        self.live_abs[code] = val
+                    events.append((ev_t, code, val))
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+        return events
 
-    entries = content.strip().split("\n\n")
-    for entry in entries:
-        lines = entry.split("\n")
-        info = {}
-        for line in lines:
-            if line.startswith("I:"):
-                m = re.search(r"Vendor=([0-9a-fA-F]+)\s+Product=([0-9a-fA-F]+)", line)
-                if m:
-                    info["vendor"] = m.group(1).lower()
-                    info["product"] = m.group(2).lower()
-            elif line.startswith("N:"):
-                m = re.search(r'Name="([^"]+)"', line)
-                if m:
-                    info["name"] = m.group(1)
-            elif line.startswith("P:"):
-                m = re.search(r"Phys=(.*)", line)
-                if m:
-                    info["phys"] = m.group(1)
-            elif line.startswith("S:"):
-                m = re.search(r"Sysfs=(.*)", line)
-                if m:
-                    info["sysfs"] = m.group(1)
-            elif line.startswith("H:"):
-                m = re.search(r"Handlers=(.*)", line)
-                if m:
-                    for h in m.group(1).split():
-                        if h.startswith("event"):
-                            info["event"] = h
-                        if h.startswith("js"):
-                            info["js"] = h
+    def poll(self):
+        """Poll calibration hardware non-blockingly, gating step progression via neutral return."""
+        with self.lock:
+            if not self.active or self.fd is None:
+                return {"active": False}
+            if self.step_idx >= len(CALIBRATION_STEPS):
+                return self.snapshot_locked()
 
-        if "virtual" in info.get("sysfs", ""):
-            continue
-        name = info.get("name", "")
-        if "Motion Sensors" in name or "(IMU)" in name or "Touchpad" in name or "Mouse" in name:
-            continue
+            events = self._drain_fd_locked()
+            if self.pending_warning is not None:
+                return self.snapshot_locked()
 
-        if "event" in info and ("js" in info or "Gamepad" in name or "Joystick" in name or "pad" in name or "Controller" in name):
-            info["dev_path"] = f"/dev/input/{info['event']}"
-            gamepads.append(info)
+            if self.waiting_neutral:
+                all_rest = all(
+                    is_axis_at_rest(c, v, self.abs_info) for c, v in self.live_abs.items()
+                )
+                if not self.held_keys and all_rest:
+                    self.waiting_neutral = False
+                return self.snapshot_locked()
 
-    return gamepads
+            step = CALIBRATION_STEPS[self.step_idx]
+            for ev_t, code, val in events:
+                detected = detect_input_event(ev_t, code, val, self.abs_info)
+                if not detected:
+                    continue
+                warn = detect_digital_mode_warning(step["key"], detected)
+                if warn:
+                    self.pending_warning = warn
+                    self.pending_detected = detected
+                    return self.snapshot_locked()
+
+                self.mapping[step["key"]] = detected
+                self.step_idx += 1
+                self.waiting_neutral = True
+                break
+
+            return self.snapshot_locked()
+
+    def skip_step(self):
+        """Skip the current optional calibration step."""
+        with self.lock:
+            if not self.active or self.step_idx >= len(CALIBRATION_STEPS):
+                return self.snapshot_locked()
+            step = CALIBRATION_STEPS[self.step_idx]
+            if step["allow_skip"]:
+                self.mapping.pop(step["key"], None)
+                self.pending_warning = None
+                self.pending_detected = None
+                self.step_idx += 1
+                self.waiting_neutral = True
+            return self.snapshot_locked()
+
+    def prev_step(self):
+        """Step backward cleanly to recalibrate the previous control."""
+        with self.lock:
+            if not self.active:
+                return {"active": False}
+            self.pending_warning = None
+            self.pending_detected = None
+            if self.step_idx > 0:
+                self.step_idx -= 1
+                self.mapping.pop(CALIBRATION_STEPS[self.step_idx]["key"], None)
+                self.waiting_neutral = True
+            return self.snapshot_locked()
+
+    def accept_warning(self):
+        """Accept a detected input even though a Digital Mode warning was raised."""
+        with self.lock:
+            if not self.active or not self.pending_detected or self.step_idx >= len(CALIBRATION_STEPS):
+                return self.snapshot_locked()
+            step = CALIBRATION_STEPS[self.step_idx]
+            self.mapping[step["key"]] = self.pending_detected
+            self.pending_warning = None
+            self.pending_detected = None
+            self.step_idx += 1
+            self.waiting_neutral = True
+            return self.snapshot_locked()
+
+    def save(self, custom_name):
+        """Finalize canonical axes, persist JSON profile, bump revision, and resume device."""
+        with self.lock:
+            if not self.active or not self.dev_info:
+                raise RuntimeError("No hay calibración activa")
+            hw_name = self.dev_info.get("name", "Mando Genérico")
+            final_name = (custom_name or "").strip() or hw_name
+            final_mapping = derive_canonical_axes(self.mapping)
+            profile = {
+                "name": final_name,
+                "hardware_name": hw_name,
+                "vendor": self.dev_info.get("vendor", "0000"),
+                "product": self.dev_info.get("product", "0000"),
+                "mapping": final_mapping,
+            }
+            out_path = save_profile(profile)
+        with state.lock:
+            state.profile_revision += 1
+        self.cancel()
+        return {"saved": True, "path": out_path, "name": final_name}
+
+    def cancel(self):
+        """Close raw calibration fd and release paused state so device returns to live slots."""
+        with self.lock:
+            fd = self.fd
+            dev_info = self.dev_info
+            self.active = False
+            self.fd = None
+            self.dev_info = None
+            self.pending_warning = None
+            self.pending_detected = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if dev_info is not None:
+            with state.lock:
+                state.paused_devices.discard(dev_info.get("dev_path"))
+                state.paused_devices.discard(dev_info.get("identifier"))
+            state.supervisor_wakeup.set()
+
+    def snapshot_locked(self):
+        """Return UI-friendly representation of the current calibration state."""
+        completed = self.step_idx >= len(CALIBRATION_STEPS)
+        final_map = derive_canonical_axes(self.mapping) if completed else self.mapping
+        return {
+            "active": self.active,
+            "completed": completed,
+            "step_idx": self.step_idx,
+            "total_steps": len(CALIBRATION_STEPS),
+            "current_step": CALIBRATION_STEPS[self.step_idx] if not completed else None,
+            "steps": CALIBRATION_STEPS,
+            "mapped_keys": list(self.mapping.keys()),
+            "warning": self.pending_warning,
+            "default_name": (self.dev_info or {}).get("name", "Mando"),
+            "warnings": validate_calibration_consistency(final_map) if completed else [],
+        }
+
+
+cal_session = CalibrationSession()
+
 
 class GamepadWorker(threading.Thread):
-    def __init__(self, dev_info, profile, player_num):
+    """Per-controller worker thread reading evdev events and driving VirtualXboxPad."""
+
+    def __init__(self, dev_info, profile, player_num, bridge_mode=True):
         super().__init__(daemon=True)
         self.dev_info = dev_info
-        self.profile = profile
+        self.identifier = dev_info["identifier"]
         self.player_num = player_num
-        self.running = True
+        self.bridge_mode = bool(bridge_mode)
+        self._stop_event = threading.Event()
+        self._cfg_lock = threading.Lock()
+        self._cleaned_up = False
+
         self.dev_fd = None
         self.vpad = None
+        self.phys_rw = False
+        self.phys_ff = False
+        self.abs_info = {}
 
         self.btn_map = {}
         self.hat_map = {}
         self.axis_map = {}
-
-        mapping = profile.get("mapping", {})
-        for target, data in mapping.items():
-            t_type = data.get("type")
-            code = data.get("code")
-            if t_type == "btn":
-                self.btn_map[code] = target
-            elif t_type == "hat":
-                self.hat_map[(code, data.get("value"))] = target
-
-        canonical_axes = ["leftx", "lefty", "rightx", "righty", "lt", "rt"]
-        for target in canonical_axes:
-            if target in mapping:
-                data = mapping[target]
-                if data.get("type") == "axis":
-                    self.axis_map[data.get("code")] = (target, data.get("direction", 1))
-
-        if "leftx" not in mapping and "left_right" in mapping:
-            self.axis_map[mapping["left_right"]["code"]] = ("leftx", 1)
-        if "lefty" not in mapping and "left_down" in mapping:
-            self.axis_map[mapping["left_down"]["code"]] = ("lefty", 1)
-        if "rightx" not in mapping and "right_right" in mapping:
-            self.axis_map[mapping["right_right"]["code"]] = ("rightx", 1)
-        if "righty" not in mapping and "right_down" in mapping:
-            self.axis_map[mapping["right_down"]["code"]] = ("righty", 1)
-
+        self.axis_dpad_map = {}
         self.dpad_state = {"x": 0, "y": 0}
+        self.deadzone_left = 0.05
+        self.deadzone_right = 0.05
+        self.center_offset = {"lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0}
+        self.rumble_enabled = True
+        self.profile = copy.deepcopy(profile)
+        self._compile_profile(self.profile)
+
         self.live_state = {
             "lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0,
+            "raw_lx": 0.0, "raw_ly": 0.0, "raw_rx": 0.0, "raw_ry": 0.0,
             "lt": 0, "rt": 0,
             "buttons": {
                 "a": False, "b": False, "x": False, "y": False,
                 "lb": False, "rb": False, "lt": False, "rt": False,
                 "back": False, "start": False, "guide": False,
                 "thumbl": False, "thumbr": False,
-                "dpup": False, "dpdown": False, "dpleft": False, "dpright": False
-            }
+                "dpup": False, "dpdown": False, "dpleft": False, "dpright": False,
+            },
         }
 
-    def run(self):
-        dev_path = self.dev_info["dev_path"]
-        grabbed = False
-        try:
-            for attempt in range(5):
-                try:
-                    self.dev_fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
-                    fcntl.ioctl(self.dev_fd, EVIOCGRAB, 1)
-                    grabbed = True
-                    break
-                except Exception:
-                    if self.dev_fd is not None:
-                        try:
-                            os.close(self.dev_fd)
-                        except Exception:
-                            pass
-                        self.dev_fd = None
-                    time.sleep(0.15)
+    def _compile_profile(self, profile):
+        """Parse profile mapping, deadzone, center offsets, and rumble flag under _cfg_lock."""
+        btn_map = {}
+        hat_map = {}
+        axis_map = {}
+        axis_dpad_map = {}
+        mapping = profile.get("mapping", {})
 
-            if not grabbed:
+        for target, data in mapping.items():
+            if not isinstance(data, dict):
+                continue
+            t_type = data.get("type")
+            code = data.get("code")
+            if code is None:
+                continue
+            if t_type == "btn":
+                btn_map[code] = target
+            elif t_type == "hat":
+                hat_map[(code, data.get("value"))] = target
+            elif t_type == "axis" and target in ("dpup", "dpdown", "dpleft", "dpright"):
+                axis_dpad_map.setdefault(code, []).append((target, data.get("direction", 1)))
+
+        canonical_axes = ("leftx", "lefty", "rightx", "righty", "lt", "rt")
+        for target in canonical_axes:
+            data = mapping.get(target)
+            if isinstance(data, dict) and data.get("type") == "axis":
+                axis_map[data.get("code")] = (target, data.get("direction", 1))
+
+        # Safe fallback for legacy profiles lacking canonical keys
+        legacy = [
+            ("leftx", "left_right", 1),
+            ("lefty", "left_down", 1),
+            ("rightx", "right_right", 1),
+            ("righty", "right_down", 1),
+        ]
+        for canon, dir_key, default_dir in legacy:
+            if canon not in mapping and isinstance(mapping.get(dir_key), dict):
+                d = mapping[dir_key]
+                if d.get("type") == "axis" and d.get("code") is not None:
+                    axis_map[d["code"]] = (canon, d.get("direction", default_dir))
+
+        with self._cfg_lock:
+            self.profile = copy.deepcopy(profile)
+            self.btn_map = btn_map
+            self.hat_map = hat_map
+            self.axis_map = axis_map
+            self.axis_dpad_map = axis_dpad_map
+            self.deadzone_left = float(profile.get("deadzone_left", 0.05))
+            self.deadzone_right = float(profile.get("deadzone_right", 0.05))
+            co = profile.get("center_offset") or {}
+            self.center_offset = {
+                "lx": float(co.get("lx", 0.0)),
+                "ly": float(co.get("ly", 0.0)),
+                "rx": float(co.get("rx", 0.0)),
+                "ry": float(co.get("ry", 0.0)),
+            }
+            self.rumble_enabled = bool(profile.get("rumble_enabled", True))
+
+    def hot_reload_profile(self, profile):
+        """Apply updated deadzones, center offsets, or mappings in-place if device active."""
+        self._compile_profile(profile)
+        with state.lock:
+            slot_info = state.active_slots.get(self.player_num)
+            if slot_info and slot_info.get("identifier") == self.identifier:
+                slot_info["name"] = self.profile.get("name")
+                slot_info["deadzone_left"] = self.deadzone_left
+                slot_info["deadzone_right"] = self.deadzone_right
+                slot_info["rumble_enabled"] = self.rumble_enabled
+
+    def _open_physical_device(self, dev_path):
+        """Open evdev device (preferring RW for rumble) and apply EVIOCGRAB if bridge_mode."""
+        last_err = None
+        for _ in range(5):
+            if self._stop_event.is_set():
+                return False
+            fd = None
+            try:
+                try:
+                    fd = os.open(dev_path, os.O_RDWR | os.O_NONBLOCK)
+                    self.phys_rw = True
+                except PermissionError:
+                    fd = os.open(dev_path, os.O_RDONLY | os.O_NONBLOCK)
+                    self.phys_rw = False
+
+                if self.bridge_mode:
+                    fcntl.ioctl(fd, EVIOCGRAB, 1)
+
+                self.dev_fd = fd
+                self.abs_info = get_abs_info(fd)
+                self.phys_ff = self.phys_rw and get_ff_support(fd)
+                return True
+            except Exception as exc:
+                last_err = exc
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                time.sleep(0.15)
+
+        msg = f"{self.dev_info.get('name', dev_path)} ({dev_path}): {last_err}"
+        print(f"[Worker P{self.player_num}] Error abriendo dispositivo: {msg}", file=sys.stderr)
+        with state.lock:
+            state.device_errors[self.identifier] = msg
+        return False
+
+    def _handle_key_event(self, code, value):
+        """Translate physical EV_KEY presses (including autorepeat value=2) to Xbox outputs."""
+        with self._cfg_lock:
+            target = self.btn_map.get(code)
+        if not target:
+            return
+
+        is_pressed = (value != 0)
+        self.live_state["buttons"][target] = is_pressed
+
+        if target == "lt":
+            self.live_state["lt"] = 100 if is_pressed else 0
+            if self.vpad:
+                self.vpad.emit_abs(ABS_Z, 255 if is_pressed else 0)
+            return
+        if target == "rt":
+            self.live_state["rt"] = 100 if is_pressed else 0
+            if self.vpad:
+                self.vpad.emit_abs(ABS_RZ, 255 if is_pressed else 0)
+            return
+
+        if target == "dpup":
+            self.dpad_state["y"] = -1 if is_pressed else (0 if self.dpad_state["y"] == -1 else self.dpad_state["y"])
+            if self.vpad:
+                self.vpad.emit_abs(ABS_HAT0Y, self.dpad_state["y"])
+            return
+        if target == "dpdown":
+            self.dpad_state["y"] = 1 if is_pressed else (0 if self.dpad_state["y"] == 1 else self.dpad_state["y"])
+            if self.vpad:
+                self.vpad.emit_abs(ABS_HAT0Y, self.dpad_state["y"])
+            return
+        if target == "dpleft":
+            self.dpad_state["x"] = -1 if is_pressed else (0 if self.dpad_state["x"] == -1 else self.dpad_state["x"])
+            if self.vpad:
+                self.vpad.emit_abs(ABS_HAT0X, self.dpad_state["x"])
+            return
+        if target == "dpright":
+            self.dpad_state["x"] = 1 if is_pressed else (0 if self.dpad_state["x"] == 1 else self.dpad_state["x"])
+            if self.vpad:
+                self.vpad.emit_abs(ABS_HAT0X, self.dpad_state["x"])
+            return
+
+        if not self.vpad:
+            return
+
+        btn_lookup = {
+            "a": BTN_A, "b": BTN_B, "x": BTN_X, "y": BTN_Y,
+            "lb": BTN_TL, "rb": BTN_TR, "back": BTN_SELECT, "start": BTN_START,
+            "guide": BTN_MODE, "thumbl": BTN_THUMBL, "thumbr": BTN_THUMBR,
+        }
+        xbox_btn = btn_lookup.get(target)
+        if xbox_btn is not None:
+            self.vpad.emit_key(xbox_btn, is_pressed)
+
+    def _handle_abs_event(self, code, value):
+        """Translate D-Pad hats, axis D-Pads, triggers, and deadzone-compensated sticks."""
+        with self._cfg_lock:
+            hat_target = self.hat_map.get((code, value))
+            hat_alt_pos = self.hat_map.get((code, 1)) or self.hat_map.get((code, -1))
+            axis_dpad = self.axis_dpad_map.get(code)
+            axis_spec = self.axis_map.get(code)
+            dz_l = self.deadzone_left
+            dz_r = self.deadzone_right
+            offsets = self.center_offset
+
+        if hat_target or (hat_alt_pos and value == 0) or code in (ABS_HAT0X, ABS_HAT0Y):
+            if code == ABS_HAT0X or hat_target in ("dpleft", "dpright"):
+                self.live_state["buttons"]["dpleft"] = (value < 0)
+                self.live_state["buttons"]["dpright"] = (value > 0)
+                if self.vpad:
+                    self.vpad.emit_abs(ABS_HAT0X, -1 if value < 0 else (1 if value > 0 else 0))
+                return
+            if code == ABS_HAT0Y or hat_target in ("dpup", "dpdown"):
+                self.live_state["buttons"]["dpup"] = (value < 0)
+                self.live_state["buttons"]["dpdown"] = (value > 0)
+                if self.vpad:
+                    self.vpad.emit_abs(ABS_HAT0Y, -1 if value < 0 else (1 if value > 0 else 0))
                 return
 
-            abs_info = get_abs_info(self.dev_fd)
-            if state.bridge_enabled:
-                self.vpad = VirtualXboxPad(self.player_num, custom_name=self.profile.get("name"))
+        if axis_dpad:
+            info = self.abs_info.get(code, {"min": 0, "max": 255})
+            mid = (info["min"] + info["max"]) / 2.0
+            span = max(1.0, (info["max"] - info["min"]) / 2.0)
+            norm = (value - mid) / span
+            for target, direction in axis_dpad:
+                pressed = (norm * direction) > 0.5
+                self.live_state["buttons"][target] = pressed
+                if target == "dpup" and pressed:
+                    self.dpad_state["y"] = -1
+                elif target == "dpdown" and pressed:
+                    self.dpad_state["y"] = 1
+                elif target in ("dpup", "dpdown") and not self.live_state["buttons"]["dpup"] and not self.live_state["buttons"]["dpdown"]:
+                    self.dpad_state["y"] = 0
+                elif target == "dpleft" and pressed:
+                    self.dpad_state["x"] = -1
+                elif target == "dpright" and pressed:
+                    self.dpad_state["x"] = 1
+                elif target in ("dpleft", "dpright") and not self.live_state["buttons"]["dpleft"] and not self.live_state["buttons"]["dpright"]:
+                    self.dpad_state["x"] = 0
+            if self.vpad:
+                self.vpad.emit_abs(ABS_HAT0X, self.dpad_state["x"])
+                self.vpad.emit_abs(ABS_HAT0Y, self.dpad_state["y"])
+            return
+
+        if not axis_spec:
+            return
+
+        target, direction = axis_spec
+        info = self.abs_info.get(code, {"min": 0, "max": 255})
+        val_min, val_max = info["min"], info["max"]
+
+        if target in ("lt", "rt"):
+            span = max(1, val_max - val_min)
+            trig_norm = max(0.0, min(1.0, (value - val_min) / span))
+            trig_val = int(trig_norm * 255)
+            pct = int(trig_norm * 100)
+            self.live_state[target] = pct
+            self.live_state["buttons"][target] = (pct > 15)
+            if self.vpad:
+                self.vpad.emit_abs(ABS_Z if target == "lt" else ABS_RZ, trig_val)
+            return
+
+        mid = (val_min + val_max) / 2.0
+        span = (val_max - val_min) / 2.0
+        if span <= 0:
+            return
+
+        axis_key_map = {
+            "leftx": ("lx", ABS_X, dz_l),
+            "lefty": ("ly", ABS_Y, dz_l),
+            "rightx": ("rx", ABS_RX, dz_r),
+            "righty": ("ry", ABS_RY, dz_r),
+        }
+        spec = axis_key_map.get(target)
+        if not spec:
+            return
+        live_key, xbox_code, dz = spec
+
+        raw_norm = ((value - mid) / span) * direction
+        adj = max(-1.0, min(1.0, raw_norm - offsets.get(live_key, 0.0)))
+        self.live_state["raw_" + live_key] = round(raw_norm, 3)
+        self.live_state[live_key] = round(adj, 2)
+
+        if abs(adj) < dz:
+            scaled = 0.0
+        else:
+            # Smoothly rescale remaining travel so 100% reach is preserved for larger deadzones
+            scaled = ((abs(adj) - dz) / max(0.01, 1.0 - dz)) * (1.0 if adj > 0 else -1.0)
+        xbox_val = int(max(-1.0, min(1.0, scaled)) * 32767)
+        if self.vpad:
+            self.vpad.emit_abs(xbox_code, xbox_val)
+
+    def run(self):
+        """Main worker loop: open device, register virtual pad, and relay input/rumble events."""
+        dev_path = self.dev_info["dev_path"]
+        try:
+            if not self._open_physical_device(dev_path):
+                return
+
+            if self.bridge_mode:
+                try:
+                    self.vpad = VirtualXboxPad(
+                        self.player_num,
+                        custom_name=self.profile.get("name"),
+                        enable_rumble=True,
+                    )
+                except Exception as exc:
+                    msg = f"No se pudo crear mando virtual /dev/uinput: {exc}"
+                    print(f"[Worker P{self.player_num}] {msg}", file=sys.stderr)
+                    with state.lock:
+                        state.device_errors[self.identifier] = msg
+                    return
 
             with state.lock:
+                state.device_errors.pop(self.identifier, None)
                 state.active_slots[self.player_num] = {
                     "name": self.profile.get("name"),
                     "vendor": self.profile.get("vendor"),
                     "product": self.profile.get("product"),
                     "dev_path": dev_path,
-                    "player_num": self.player_num
+                    "identifier": self.identifier,
+                    "pin_key": self.dev_info.get("pin_key", ""),
+                    "player_num": self.player_num,
+                    "deadzone_left": self.deadzone_left,
+                    "deadzone_right": self.deadzone_right,
+                    "rumble_enabled": self.rumble_enabled,
                 }
+                state.live_inputs[self.player_num] = copy.deepcopy(self.live_state)
 
-            while self.running:
-                r, _, _ = select.select([self.dev_fd], [], [], 0.05)
-                if not r:
+            while not self._stop_event.is_set():
+                fd = self.dev_fd
+                if fd is None:
+                    break
+                watch_fds = [fd]
+                if self.vpad is not None and self.vpad.fd is not None and self.vpad.enable_rumble:
+                    watch_fds.append(self.vpad.fd)
+
+                try:
+                    readable, _, _ = select.select(watch_fds, [], [], 0.05)
+                except (ValueError, OSError):
+                    break
+                if not readable:
+                    continue
+
+                if self.vpad is not None and self.vpad.fd in readable:
+                    with self._cfg_lock:
+                        fwd_rumble = self.rumble_enabled and self.phys_ff
+                    self.vpad.handle_ff_events(phys_fd=fd, forward_rumble=fwd_rumble)
+
+                if fd not in readable:
                     continue
 
                 try:
-                    data = os.read(self.dev_fd, EVENT_SIZE * 32)
-                except OSError:
+                    data = os.read(fd, EVENT_SIZE * 32)
+                except BlockingIOError:
+                    continue
+                except (OSError, TypeError):
                     break
 
                 if not data:
@@ -222,589 +715,636 @@ class GamepadWorker(threading.Thread):
                 num_events = len(data) // EVENT_SIZE
                 for i in range(num_events):
                     ev = data[i * EVENT_SIZE : (i + 1) * EVENT_SIZE]
-                    tv_sec, tv_usec, ev_type, code, value = struct.unpack(EVENT_FORMAT, ev)
-
+                    _, _, ev_type, code, value = struct.unpack(EVENT_FORMAT, ev)
                     if ev_type == EV_KEY:
-                        target = self.btn_map.get(code)
-                        if target:
-                            is_pressed = (value == 1)
-                            self.live_state["buttons"][target] = is_pressed
-                            if self.vpad:
-                                if target == "a": self.vpad.emit_key(BTN_A, is_pressed)
-                                elif target == "b": self.vpad.emit_key(BTN_B, is_pressed)
-                                elif target == "x": self.vpad.emit_key(BTN_X, is_pressed)
-                                elif target == "y": self.vpad.emit_key(BTN_Y, is_pressed)
-                                elif target == "lb": self.vpad.emit_key(BTN_TL, is_pressed)
-                                elif target == "rb": self.vpad.emit_key(BTN_TR, is_pressed)
-                                elif target == "lt":
-                                    self.live_state["lt"] = 100 if is_pressed else 0
-                                    self.vpad.emit_abs(ABS_Z, 255 if is_pressed else 0)
-                                elif target == "rt":
-                                    self.live_state["rt"] = 100 if is_pressed else 0
-                                    self.vpad.emit_abs(ABS_RZ, 255 if is_pressed else 0)
-                                elif target == "back": self.vpad.emit_key(BTN_SELECT, is_pressed)
-                                elif target == "start": self.vpad.emit_key(BTN_START, is_pressed)
-                                elif target == "guide": self.vpad.emit_key(BTN_MODE, is_pressed)
-                                elif target == "thumbl": self.vpad.emit_key(BTN_THUMBL, is_pressed)
-                                elif target == "thumbr": self.vpad.emit_key(BTN_THUMBR, is_pressed)
-                                elif target == "dpup":
-                                    self.dpad_state["y"] = -1 if is_pressed else (0 if self.dpad_state["y"] == -1 else self.dpad_state["y"])
-                                    self.vpad.emit_abs(ABS_HAT0Y, self.dpad_state["y"])
-                                elif target == "dpdown":
-                                    self.dpad_state["y"] = 1 if is_pressed else (0 if self.dpad_state["y"] == 1 else self.dpad_state["y"])
-                                    self.vpad.emit_abs(ABS_HAT0Y, self.dpad_state["y"])
-                                elif target == "dpleft":
-                                    self.dpad_state["x"] = -1 if is_pressed else (0 if self.dpad_state["x"] == -1 else self.dpad_state["x"])
-                                    self.vpad.emit_abs(ABS_HAT0X, self.dpad_state["x"])
-                                elif target == "dpright":
-                                    self.dpad_state["x"] = 1 if is_pressed else (0 if self.dpad_state["x"] == 1 else self.dpad_state["x"])
-                                    self.vpad.emit_abs(ABS_HAT0X, self.dpad_state["x"])
-
+                        self._handle_key_event(code, value)
                     elif ev_type == EV_ABS:
-                        if (code, value) in self.hat_map:
-                            target = self.hat_map[(code, value)]
-                            is_active = (value != 0)
-                            self.live_state["buttons"][target] = is_active
-                            if self.vpad:
-                                if target in ("dpup", "dpdown"): self.vpad.emit_abs(ABS_HAT0Y, value)
-                                elif target in ("dpleft", "dpright"): self.vpad.emit_abs(ABS_HAT0X, value)
-                        elif code in (16, 17) and value == 0:
-                            if code == 16:
-                                self.live_state["buttons"]["dpleft"] = False
-                                self.live_state["buttons"]["dpright"] = False
-                                if self.vpad: self.vpad.emit_abs(ABS_HAT0X, 0)
-                            elif code == 17:
-                                self.live_state["buttons"]["dpup"] = False
-                                self.live_state["buttons"]["dpdown"] = False
-                                if self.vpad: self.vpad.emit_abs(ABS_HAT0Y, 0)
+                        self._handle_abs_event(code, value)
 
-                        elif code in self.axis_map:
-                            target, direction = self.axis_map[code]
-                            info = abs_info.get(code, {"min": 0, "max": 255, "val": 0})
-                            val_min, val_max = info["min"], info["max"]
-
-                            if target in ("lt", "rt"):
-                                span = max(1, val_max - val_min)
-                                trig_norm = max(0.0, min(1.0, (value - val_min) / span))
-                                trig_val = int(trig_norm * 255)
-                                pct = int(trig_norm * 100)
-                                self.live_state[target] = pct
-                                self.live_state["buttons"][target] = (pct > 15)
-                                if self.vpad:
-                                    if target == "lt": self.vpad.emit_abs(ABS_Z, trig_val)
-                                    elif target == "rt": self.vpad.emit_abs(ABS_RZ, trig_val)
-
-                            elif target in ("leftx", "lefty", "rightx", "righty"):
-                                mid = (val_min + val_max) / 2.0
-                                span = (val_max - val_min) / 2.0
-                                if span > 0:
-                                    norm = (value - mid) / span * direction
-                                    raw_norm = norm
-                                    if abs(norm) < 0.05:
-                                        norm = 0.0
-                                    xbox_val = int(max(-1.0, min(1.0, norm)) * 32767)
-
-                                    if target == "leftx":
-                                        self.live_state["lx"] = round(raw_norm, 2)
-                                        if self.vpad: self.vpad.emit_abs(ABS_X, xbox_val)
-                                    elif target == "lefty":
-                                        self.live_state["ly"] = round(raw_norm, 2)
-                                        if self.vpad: self.vpad.emit_abs(ABS_Y, xbox_val)
-                                    elif target == "rightx":
-                                        self.live_state["rx"] = round(raw_norm, 2)
-                                        if self.vpad: self.vpad.emit_abs(ABS_RX, xbox_val)
-                                    elif target == "righty":
-                                        self.live_state["ry"] = round(raw_norm, 2)
-                                        if self.vpad: self.vpad.emit_abs(ABS_RY, xbox_val)
-
-                if self.vpad:
+                if self.vpad is not None:
                     self.vpad.sync()
 
                 with state.lock:
-                    state.live_inputs[self.player_num] = self.live_state
+                    if state.active_slots.get(self.player_num, {}) and state.active_slots[self.player_num].get("identifier") == self.identifier:
+                        state.live_inputs[self.player_num] = copy.deepcopy(self.live_state)
         finally:
-            self.cleanup()
+            self._cleanup_once()
 
-    def cleanup(self):
-        self.running = False
+    def _cleanup_once(self):
+        """Release grab, descriptors, and slot references strictly once on worker exit."""
+        if self._cleaned_up:
+            return
+        self._cleaned_up = True
+        self._stop_event.set()
+
         with state.lock:
-            state.active_slots[self.player_num] = None
-            state.live_inputs[self.player_num] = {}
-        if self.dev_fd is not None:
-            try:
-                fcntl.ioctl(self.dev_fd, EVIOCGRAB, 0)
-            except Exception:
-                pass
-            try:
-                os.close(self.dev_fd)
-            except Exception:
-                pass
-            self.dev_fd = None
-        if self.vpad is not None:
-            try:
-                self.vpad.close()
-            except Exception:
-                pass
-            self.vpad = None
+            cur = state.active_slots.get(self.player_num)
+            if cur and cur.get("identifier") == self.identifier:
+                state.active_slots[self.player_num] = None
+                state.live_inputs[self.player_num] = {}
 
-    def stop(self):
-        self.running = False
-        self.cleanup()
+        fd = self.dev_fd
+        self.dev_fd = None
+        if fd is not None:
+            if self.bridge_mode:
+                try:
+                    fcntl.ioctl(fd, EVIOCGRAB, 0)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        vpad = self.vpad
+        self.vpad = None
+        if vpad is not None:
+            vpad.close()
+
+    def stop(self, wait=True):
+        """Signal loop termination and optionally join worker thread so resources close cleanly."""
+        self._stop_event.set()
+        if wait and threading.current_thread() is not self and self.is_alive():
+            self.join(timeout=1.0)
+
+
+def _pick_slot_for_device(gp, assigned_slots, slot_overrides, slot_pins):
+    """Select preferred override/pinned slot if free, otherwise first free slot 1..MAX_SLOTS."""
+    ident = gp["identifier"]
+    pin_key = gp.get("pin_key", "")
+    preferred = slot_overrides.get(ident) or slot_pins.get(pin_key)
+    if preferred and 1 <= preferred <= MAX_SLOTS and preferred not in assigned_slots:
+        return preferred
+    for slot in range(1, MAX_SLOTS + 1):
+        if slot not in assigned_slots:
+            return slot
+    return None
+
 
 def device_supervisor():
-    while True:
+    """Poll hardware devices, stop disconnected workers, hot-reload profiles, and launch workers."""
+    retry_backoff = {}  # identifier -> (fail_count, next_retry_ts)
+    last_profile_snapshot = {}
+
+    while not state.shutdown_event.is_set():
+        state.supervisor_wakeup.clear()
         try:
             profiles = load_profiles()
             connected = get_connected_gamepads()
-            current_paths = {gp.get("phys") or gp["dev_path"] for gp in connected}
+            current_by_ident = {gp["identifier"]: gp for gp in connected}
 
+            to_stop = []
             with state.lock:
                 state.connected_devices = connected
+                bridge_mode = state.bridge_enabled
+                paused = set(state.paused_devices)
+                slot_overrides = dict(state.slot_overrides)
+                slot_pins = dict(state.slot_pins)
 
-            # Limpiar workers que murieron o fueron desconectados
-            for ident in list(state.workers.keys()):
-                worker = state.workers[ident]
-                if not worker.is_alive() or ident not in current_paths:
-                    w = state.workers.pop(ident)
-                    w.stop()
+                for ident in list(state.workers.keys()):
+                    worker = state.workers[ident]
+                    gp = current_by_ident.get(ident)
+                    must_stop = (
+                        not worker.is_alive()
+                        or gp is None
+                        or ident in paused
+                        or gp["dev_path"] in paused
+                        or worker.bridge_mode != bridge_mode
+                    )
+                    if must_stop:
+                        to_stop.append(state.workers.pop(ident))
+                    else:
+                        key = f"{gp['vendor']}:{gp['product']}"
+                        if key in profiles:
+                            prof_sig = json.dumps({k: v for k, v in profiles[key].items() if not k.startswith("_")}, sort_keys=True)
+                            if last_profile_snapshot.get(ident) != prof_sig:
+                                worker.hot_reload_profile(profiles[key])
+                                last_profile_snapshot[ident] = prof_sig
 
-            assigned_slots = {w.player_num for w in state.workers.values()}
+                for ident in list(state.device_errors.keys()):
+                    if ident not in current_by_ident:
+                        state.device_errors.pop(ident, None)
+                        retry_backoff.pop(ident, None)
 
-            for gp in connected:
-                key = f"{gp['vendor']}:{gp['product']}".lower()
-                dev_path = gp["dev_path"]
-                identifier = gp.get("phys") or dev_path
+            for w in to_stop:
+                w.stop(wait=True)
 
-                if identifier not in state.workers and key in profiles:
-                    for slot in range(1, MAX_SLOTS + 1):
-                        if slot not in assigned_slots:
-                            assigned_slots.add(slot)
-                            with state.lock:
-                                state.active_slots[slot] = {
-                                    "name": profiles[key].get("name", "Mando"),
-                                    "vendor": profiles[key].get("vendor"),
-                                    "product": profiles[key].get("product"),
-                                    "dev_path": dev_path,
-                                    "player_num": slot
-                                }
-                            worker = GamepadWorker(gp, profiles[key], slot)
-                            state.workers[identifier] = worker
-                            worker.start()
-                            break
+            # Determine slots after clean stops so reassigned/swapped slots reuse cleanly
+            now = time.monotonic()
+            with state.lock:
+                assigned_slots = {w.player_num for w in state.workers.values() if w.is_alive()}
+                new_workers = []
+                # Process slot overrides and pinned controllers first so manual swaps always win their target slot
+                ordered_devices = sorted(
+                    connected,
+                    key=lambda g: 0 if g["identifier"] in slot_overrides else (1 if g.get("pin_key") in slot_pins else 2),
+                )
+                for gp in ordered_devices:
+                    ident = gp["identifier"]
+                    key = f"{gp['vendor']}:{gp['product']}"
+                    if ident in state.workers or key not in profiles:
+                        continue
+                    if ident in state.paused_devices or gp["dev_path"] in state.paused_devices:
+                        continue
+                    fails, next_ts = retry_backoff.get(ident, (0, 0.0))
+                    if now < next_ts:
+                        continue
 
-        except Exception as e:
-            pass
+                    slot = _pick_slot_for_device(gp, assigned_slots, slot_overrides, slot_pins)
+                    if slot is None:
+                        continue
+                    assigned_slots.add(slot)
+                    worker = GamepadWorker(gp, profiles[key], slot, bridge_mode=bridge_mode)
+                    state.workers[ident] = worker
+                    last_profile_snapshot[ident] = json.dumps(
+                        {k: v for k, v in profiles[key].items() if not k.startswith("_")}, sort_keys=True
+                    )
+                    new_workers.append((ident, worker))
 
-        time.sleep(0.8)
+            for _, worker in new_workers:
+                worker.start()
 
-        time.sleep(0.8)
+            # Track transient failures for exponential backoff without flooding stderr
+            time.sleep(0.05)
+            with state.lock:
+                for ident, _ in new_workers:
+                    if ident in state.device_errors:
+                        fails, _ = retry_backoff.get(ident, (0, 0.0))
+                        fails = min(fails + 1, 4)
+                        retry_backoff[ident] = (fails, time.monotonic() + (1.0 * (2 ** (fails - 1))))
+                    elif ident in state.workers and state.workers[ident].is_alive():
+                        retry_backoff.pop(ident, None)
 
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Resiticks — Hub Universal de Joysticks</title>
-<style>
-  :root {
-    --bg: #0b1120;
-    --card-bg: #151e32;
-    --card-border: #24324f;
-    --primary: #3b82f6;
-    --primary-hover: #2563eb;
-    --success: #10b981;
-    --warning: #f59e0b;
-    --text: #f8fafc;
-    --text-muted: #94a3b8;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-  body { background: var(--bg); color: var(--text); padding: 18px; font-size: 13px; }
-  
-  header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--card-border); padding-bottom: 14px; margin-bottom: 16px; }
-  .logo-title h1 { font-size: 22px; font-weight: 800; color: #60a5fa; letter-spacing: -0.5px; display: flex; align-items: center; gap: 8px; }
-  .logo-title p { font-size: 12px; color: var(--text-muted); }
-  
-  .header-actions { display: flex; align-items: center; gap: 10px; }
-  .tabs { display: flex; gap: 8px; }
-  .tab-btn { background: var(--card-bg); color: var(--text-muted); border: 1px solid var(--card-border); padding: 7px 14px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; transition: 0.15s; }
-  .tab-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
-  
-  .btn-calibrate-top { background: #10b981; color: #fff; border: none; padding: 7px 14px; border-radius: 6px; font-weight: 700; font-size: 12px; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: 0.15s; }
-  .btn-calibrate-top:hover { background: #059669; }
-  
-  .tab-content { display: none; }
-  .tab-content.active { display: block; }
-  
-  /* Grid de Tarjetas de Jugadores (Hasta 8 slots) */
-  .slots-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 14px; }
-  @media (max-width: 900px) { .slots-grid { grid-template-columns: 1fr; } }
+        except Exception as exc:
+            import traceback
+            print(f"[Supervisor] Error en ciclo de detección: {exc}", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
-  .slot-card { background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 10px; padding: 14px; border-top: 4px solid var(--card-border); transition: 0.2s; }
-  .slot-card.connected { border-top-color: var(--success); }
-  
-  .slot-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
-  .slot-tag { font-size: 11px; font-weight: 800; background: #1e293b; padding: 3px 8px; border-radius: 4px; color: #cbd5e1; }
-  .slot-card.connected .slot-tag { background: #064e3b; color: #6ee7b7; }
-  .slot-title { font-size: 15px; font-weight: 700; color: #fff; margin-bottom: 2px; }
-  .slot-sub { font-size: 11.5px; color: var(--text-muted); margin-bottom: 10px; }
-  
-  .card-inner-tester {
-    background: #090e1a;
-    border: 1px solid #1c2742;
-    border-radius: 8px;
-    padding: 10px;
-    display: grid;
-    grid-template-columns: 150px 1fr;
-    gap: 12px;
-    align-items: center;
-  }
-  
-  .sticks-box { display: flex; justify-content: space-between; align-items: center; }
-  .stick-unit { text-align: center; }
-  .stick-circle { width: 62px; height: 62px; border-radius: 50%; border: 1px solid #334155; position: relative; background: #121929; margin: 3px 0; }
-  .deadzone-guide { width: 10px; height: 10px; border-radius: 50%; border: 1px dashed rgba(239, 68, 68, 0.6); position: absolute; top: 25px; left: 25px; }
-  .stick-dot { width: 14px; height: 14px; border-radius: 50%; background: #3b82f6; position: absolute; top: 24px; left: 24px; box-shadow: 0 0 6px #3b82f6; transition: 0.04s; }
-  .stick-label { font-size: 10px; font-weight: 600; color: var(--text-muted); text-transform: uppercase; }
-  .drift-badge { font-size: 9.5px; font-weight: 700; padding: 1px 4px; border-radius: 3px; display: inline-block; background: #064e3b; color: #6ee7b7; }
-  .drift-badge.drift { background: #78350f; color: #fcd34d; }
+        state.supervisor_wakeup.wait(timeout=0.75)
 
-  .buttons-cluster { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-  .dpad-layout { display: grid; grid-template-columns: 20px 20px 20px; grid-template-rows: 20px 20px 20px; gap: 2px; justify-content: center; align-content: center; }
-  .face-layout { display: grid; grid-template-columns: 20px 20px 20px; grid-template-rows: 20px 20px 20px; gap: 2px; justify-content: center; align-content: center; }
-  
-  .btn-chip {
-    width: 20px; height: 20px; border-radius: 4px;
-    background: #172136; border: 1px solid #293856;
-    color: #64748b; font-size: 9px; font-weight: 800;
-    display: flex; align-items: center; justify-content: center;
-    transition: 0.05s;
-  }
-  .btn-chip.circle { border-radius: 50%; font-size: 10px; }
-  .btn-chip.pressed { background: #3b82f6; color: #ffffff; border-color: #60a5fa; box-shadow: 0 0 8px rgba(59, 130, 246, 0.8); transform: scale(1.1); }
-  
-  .triggers-row { display: flex; justify-content: space-between; margin-bottom: 6px; }
-  .trig-badge { font-size: 10px; font-weight: 700; background: #172136; border: 1px solid #293856; padding: 2px 6px; border-radius: 4px; color: #94a3b8; }
-  .trig-badge.pressed { background: #10b981; color: #fff; border-color: #34d399; }
-  
-  .card-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 10px; font-size: 11px; }
-  .btn-small { background: #1e293b; color: #cbd5e1; border: 1px solid #334155; padding: 4px 10px; border-radius: 4px; font-size: 11px; cursor: pointer; text-decoration: none; font-weight: 600; }
-  .btn-small:hover { background: #334155; color: #fff; }
 
-  .btn { background: var(--primary); color: #fff; border: none; padding: 8px 16px; border-radius: 6px; font-weight: 600; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 6px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-  th { text-align: left; padding: 9px; background: #151e32; color: var(--text-muted); border-bottom: 1px solid var(--card-border); font-size: 12px; }
-  td { padding: 9px; border-bottom: 1px solid var(--card-border); font-size: 12px; }
-</style>
-</head>
-<body>
+def _update_from_github():
+    """Update profiles and scripts from ulibanus/Resiticks via git pull or archive download."""
+    app_root = resolve_app_root()
+    profiles_dir = resolve_profiles_dir()
+    repo_root = os.path.dirname(app_root) if os.path.isdir(os.path.join(os.path.dirname(app_root), ".git")) else app_root
 
-<header>
-  <div class="logo-title">
-    <h1>🎮 Resiticks</h1>
-    <p>Hub Universal de Joysticks & Puente Multi-Jugador (Hasta 8 Jugadores)</p>
-  </div>
-  <div class="header-actions">
-    <button class="btn-calibrate-top" onclick="launchCalibration()">➕ Calibrar Nuevo Mando</button>
-    <div class="tabs">
-      <button class="tab-btn active" onclick="switchTab('tab-dashboard')">🏟️ Partida en Vivo (8 Slots)</button>
-      <button class="tab-btn" onclick="switchTab('tab-profiles')">📁 Biblioteca de Amigos</button>
-    </div>
-  </div>
-</header>
+    if os.path.isdir(os.path.join(repo_root, ".git")) and shutil.which("git"):
+        try:
+            subprocess.check_output(["git", "-C", repo_root, "pull", "--ff-only"], stderr=subprocess.STDOUT, timeout=15)
+            with state.lock:
+                state.profile_revision += 1
+            return {"ok": True, "method": "git", "message": "Repositorio actualizado correctamente desde GitHub (git pull)."}
+        except subprocess.CalledProcessError as exc:
+            # Fallback to profile sync below if local git tree has custom edits
+            git_err = exc.output.decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            git_err = str(exc)
+    else:
+        git_err = None
 
-<div id="tab-dashboard" class="tab-content active">
-  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px;">
-    <div>
-      <span style="font-size: 12.5px; color: var(--text-muted);">Estado del Motor:</span>
-      <span style="color: #34d399; font-weight: 700; margin-left: 5px;">🟢 ACTIVO (8 Slots Disponibles para PES 6 / Torneos)</span>
-    </div>
-    <div style="font-size: 11.5px; color: var(--text-muted);">
-      💡 Presioná botones o palancas en cualquier mando para ver el diagnóstico en vivo
-    </div>
-  </div>
+    # Archive download fallback works on ZIP installs and dirty git clones without losing local custom profiles
+    req = urllib.request.Request(GITHUB_ARCHIVE_URL, headers={"User-Agent": "Resiticks-Updater"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        tar_bytes = resp.read()
 
-  <div class="slots-grid" id="slots-container"></div>
-</div>
+    added = 0
+    updated = 0
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes), mode="r:gz") as tf:
+        for member in tf.getmembers():
+            if not member.isfile():
+                continue
+            parts = member.name.split("/")
+            # Expect Resiticks-main/Resiticks/profiles/*.json
+            if "profiles" in parts and parts[-1].endswith(".json"):
+                idx = parts.index("profiles")
+                if idx == len(parts) - 2:
+                    raw = tf.extractfile(member).read()
+                    dest = os.path.join(profiles_dir, parts[-1])
+                    if not os.path.exists(dest):
+                        with open(dest, "wb") as f:
+                            f.write(raw)
+                        added += 1
+                    else:
+                        updated += 0  # Preserve local friend calibration unless new file
 
-<div id="tab-profiles" class="tab-content">
-  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-    <div>
-      <h2 style="font-size: 18px; color: #fff;">Biblioteca de Mandos Guardados</h2>
-      <p style="color: var(--text-muted); font-size: 12px;">Mandos calibrados y listos para conectar y jugar sin configurar nada.</p>
-    </div>
-    <div style="display: flex; gap: 10px;">
-      <button class="btn" style="background: #3b82f6;" onclick="launchCalibration()">➕ Calibrar Nuevo</button>
-      <a href="/api/export_pack" class="btn" style="background: #10b981;">📦 Descargar Pack ZIP para Amigos</a>
-    </div>
-  </div>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Nombre del Joystick</th>
-        <th>Hardware VID:PID</th>
-        <th>Estado</th>
-      </tr>
-    </thead>
-    <tbody id="profiles-body"></tbody>
-  </table>
-</div>
-
-<script>
-  function switchTab(tabId) {
-    document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
-    document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-    document.getElementById(tabId).classList.add('active');
-    event.target.classList.add('active');
-  }
-
-  async function launchCalibration() {
-    try {
-      await fetch('/api/calibrate/launch', { method: 'POST' });
-    } catch(e) {
-      alert('Error abriendo el asistente de calibración.');
-    }
-  }
-
-  function renderSlot(slot, item, inp) {
-    if (!item) {
-      return `
-        <div class="slot-card">
-          <div class="slot-header">
-            <span class="slot-tag">JUGADOR ${slot} [P${slot}]</span>
-            <span style="font-size: 11px; color: #64748b;">DISPONIBLE</span>
-          </div>
-          <div class="slot-title" style="color: #64748b;">(Slot Libre)</div>
-          <div class="slot-sub">Enchufá cualquier joystick para tomar el Jugador ${slot}.</div>
-          <div class="card-inner-tester" style="opacity: 0.3; text-align: center; display: block; padding: 25px 10px; color: #64748b;">
-            Esperando mando de amigo...
-          </div>
-        </div>
-      `;
+    with state.lock:
+        state.profile_revision += 1
+    extra = f" (nota git: {git_err})" if git_err else ""
+    return {
+        "ok": True,
+        "method": "archive",
+        "added": added,
+        "message": f"Sincronizado desde GitHub: {added} perfil(es) nuevo(s) descargado(s){extra}.",
     }
 
-    const btns = inp.buttons || {};
-    const lx = inp.lx !== undefined ? inp.lx : 0;
-    const ly = inp.ly !== undefined ? inp.ly : 0;
-    const rx = inp.rx !== undefined ? inp.rx : 0;
-    const ry = inp.ry !== undefined ? inp.ry : 0;
-    const lt = inp.lt || 0;
-    const rt = inp.rt || 0;
 
-    const driftL = (Math.abs(lx) > 0.08 || Math.abs(ly) > 0.08);
-    const driftR = (Math.abs(rx) > 0.08 || Math.abs(ry) > 0.08);
+def _build_full_export_zip():
+    """Bundle complete Resiticks package (Linux, Windows, profiles, updaters, docs) into memory ZIP."""
+    app_root = resolve_app_root()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(app_root):
+            dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "tests")]
+            for fname in sorted(files):
+                if fname.endswith((".pyc", ".pyo")) or fname == "resiticks_config.json":
+                    continue
+                full_path = os.path.join(root, fname)
+                if not os.path.isfile(full_path):
+                    continue
+                rel_path = os.path.relpath(full_path, app_root)
+                arc_path = os.path.join("Resiticks", rel_path)
+                zinfo = zipfile.ZipInfo.from_file(full_path, arc_path)
+                zinfo.compress_type = zipfile.ZIP_DEFLATED
+                if fname.endswith(".sh"):
+                    zinfo.external_attr = (0o100755 & 0xFFFF) << 16
+                with open(full_path, "rb") as src:
+                    zf.writestr(zinfo, src.read())
+    buf.seek(0)
+    return buf.read()
 
-    return `
-      <div class="slot-card connected">
-        <div class="slot-header">
-          <span class="slot-tag">JUGADOR ${slot} [P${slot}]</span>
-          <span style="font-size: 11px; color: #34d399; font-weight: 700;">🟢 CONECTADO</span>
-        </div>
-        <div class="slot-title">🎮 ${item.name}</div>
-        <div class="slot-sub">Hardware: <code>${item.vendor}:${item.product}</code> • Asignado a Xbox 360 (Player ${slot})</div>
-        
-        <div class="card-inner-tester">
-          <div class="sticks-box">
-            <div class="stick-unit">
-              <div class="stick-label">Stick Izq</div>
-              <div class="stick-circle">
-                <div class="deadzone-guide"></div>
-                <div class="stick-dot" style="transform: translate(${lx * 23}px, ${ly * 23}px);"></div>
-              </div>
-              <span class="drift-badge ${driftL ? 'drift' : ''}">${driftL ? '⚠️ Moviendo' : 'Drift: OK'}</span>
-            </div>
-            
-            <div class="stick-unit">
-              <div class="stick-label">Stick Der</div>
-              <div class="stick-circle">
-                <div class="deadzone-guide"></div>
-                <div class="stick-dot" style="transform: translate(${rx * 23}px, ${ry * 23}px);"></div>
-              </div>
-              <span class="drift-badge ${driftR ? 'drift' : ''}">${driftR ? '⚠️ Moviendo' : 'Drift: OK'}</span>
-            </div>
-          </div>
-
-          <div>
-            <div class="triggers-row">
-              <span class="trig-badge ${btns.lb ? 'pressed' : ''}">LB</span>
-              <span class="trig-badge ${lt > 15 ? 'pressed' : ''}">LT ${lt}%</span>
-              <span class="trig-badge ${rt > 15 ? 'pressed' : ''}">RT ${rt}%</span>
-              <span class="trig-badge ${btns.rb ? 'pressed' : ''}">RB</span>
-            </div>
-
-            <div class="buttons-cluster">
-              <div class="dpad-layout">
-                <div></div>
-                <div class="btn-chip ${btns.dpup ? 'pressed' : ''}">▲</div>
-                <div></div>
-                <div class="btn-chip ${btns.dpleft ? 'pressed' : ''}">◀</div>
-                <div class="btn-chip" style="font-size: 7px; color: #475569;">+</div>
-                <div class="btn-chip ${btns.dpright ? 'pressed' : ''}">▶</div>
-                <div></div>
-                <div class="btn-chip ${btns.dpdown ? 'pressed' : ''}">▼</div>
-                <div></div>
-              </div>
-
-              <div class="face-layout">
-                <div></div>
-                <div class="btn-chip circle ${btns.y ? 'pressed' : ''}">Y</div>
-                <div></div>
-                <div class="btn-chip circle ${btns.x ? 'pressed' : ''}">X</div>
-                <div class="btn-chip circle" style="font-size: 8px; color: #475569;">Xbox</div>
-                <div class="btn-chip circle ${btns.b ? 'pressed' : ''}">B</div>
-                <div></div>
-                <div class="btn-chip circle ${btns.a ? 'pressed' : ''}">A</div>
-                <div></div>
-              </div>
-            </div>
-
-            <div style="display: flex; justify-content: space-around; margin-top: 6px; font-size: 10px;">
-              <span class="trig-badge ${btns.back ? 'pressed' : ''}">SELECT</span>
-              <span class="trig-badge ${btns.thumbl ? 'pressed' : ''}">L3</span>
-              <span class="trig-badge ${btns.thumbr ? 'pressed' : ''}">R3</span>
-              <span class="trig-badge ${btns.start ? 'pressed' : ''}">START</span>
-            </div>
-          </div>
-        </div>
-
-        <div class="card-footer">
-          <span style="color: #6ee7b7; font-weight: 600;">✓ Mando Calibrado</span>
-          <button class="btn-small" onclick="launchCalibration()">⚙️ Recalibrar</button>
-        </div>
-      </div>
-    `;
-  }
-
-  async function updateDashboard() {
-    try {
-      const res = await fetch('/api/status');
-      const data = await res.json();
-      
-      const container = document.getElementById('slots-container');
-      let html = '';
-      for (let slot = 1; slot <= 8; slot++) {
-        const item = data.active_slots[slot];
-        const inp = data.live_inputs[slot] || {};
-        html += renderSlot(slot, item, inp);
-      }
-      container.innerHTML = html;
-    } catch (e) {}
-  }
-
-  async function loadProfilesList() {
-    try {
-      const res = await fetch('/api/profiles');
-      const profiles = await res.json();
-      const body = document.getElementById('profiles-body');
-      let html = '';
-      for (const p of profiles) {
-        html += `
-          <tr>
-            <td><strong>🎮 ${p.name}</strong></td>
-            <td><code>${p.vendor}:${p.product}</code></td>
-            <td><span class="slot-tag" style="background: #064e3b; color: #6ee7b7;">Listo para Usar</span></td>
-          </tr>
-        `;
-      }
-      body.innerHTML = html;
-    } catch(e) {}
-  }
-
-  setInterval(updateDashboard, 70);
-  loadProfilesList();
-</script>
-
-</body>
-</html>
-"""
 
 class ResiticksHTTPHandler(BaseHTTPRequestHandler):
+    """HTTP API & dashboard request handler for Resiticks."""
+
     def log_message(self, format, *args):
         pass
 
-    def do_POST(self):
-        url = urllib.parse.urlparse(self.path)
-        if url.path == "/api/calibrate/launch":
-            term = "alacritty" if os.path.exists("/usr/bin/alacritty") else "kitty"
-            subprocess.Popen([term, "-e", "python3", os.path.join(BASE_DIR, "calibrate.py")])
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(b'{"status": "launched"}')
-        else:
-            self.send_response(404)
-            self.end_headers()
+    def _send_bytes(self, status, content_type, data_bytes, extra_headers=None):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data_bytes)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        if data_bytes:
+            self.wfile.write(data_bytes)
+
+    def _send_json(self, status, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(status, "application/json", body)
+
+    def _read_json_body(self):
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        if length <= 0:
+            return {}
+        if length > 1024 * 1024:
+            raise ValueError("Payload demasiado grande")
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def do_OPTIONS(self):
+        self._send_bytes(204, "text/plain", b"")
 
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
-        if url.path == "/" or url.path == "/index.html":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(HTML_PAGE.encode("utf-8"))
+        if url.path in ("/", "/index.html"):
+            self._send_bytes(200, "text/html; charset=utf-8", HTML_PAGE.encode("utf-8"))
+            return
 
-        elif url.path == "/api/status":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            with state.lock:
-                data = {
-                    "bridge_enabled": state.bridge_enabled,
-                    "active_slots": state.active_slots,
-                    "live_inputs": state.live_inputs
-                }
-            self.wfile.write(json.dumps(data).encode("utf-8"))
-
-        elif url.path == "/api/profiles":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
+        if url.path == "/api/status":
             profiles = load_profiles()
-            plist = [{"name": p.get("name"), "vendor": p.get("vendor"), "product": p.get("product")} for p in profiles.values()]
-            self.wfile.write(json.dumps(plist).encode("utf-8"))
+            with state.lock:
+                connected = copy.deepcopy(state.connected_devices)
+                uncalibrated = [
+                    gp for gp in connected
+                    if f"{gp.get('vendor')}:{gp.get('product')}" not in profiles
+                ]
+                payload = {
+                    "bridge_enabled": state.bridge_enabled,
+                    "active_slots": copy.deepcopy(state.active_slots),
+                    "live_inputs": copy.deepcopy(state.live_inputs),
+                    "connected_devices": connected,
+                    "uncalibrated_devices": uncalibrated,
+                    "device_errors": copy.deepcopy(state.device_errors),
+                    "profile_revision": state.profile_revision,
+                }
+            self._send_json(200, payload)
+            return
 
-        elif url.path == "/api/export_pack":
-            buf = io.BytesIO()
-            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-                for p in glob.glob(os.path.join(PROFILES_DIR, "*.json")):
-                    zf.write(p, arcname=os.path.join("profiles", os.path.basename(p)))
-                zf.write(os.path.join(BASE_DIR, "bridge.py"), arcname="bridge.py")
-                zf.write(os.path.join(BASE_DIR, "virtual_xbox.py"), arcname="virtual_xbox.py")
-                zf.write(os.path.join(BASE_DIR, "calibrate.py"), arcname="calibrate.py")
-            buf.seek(0)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Disposition", 'attachment; filename="resiticks_amigos_pack.zip"')
-            self.end_headers()
-            self.wfile.write(buf.read())
+        if url.path == "/api/profiles":
+            profiles = load_profiles()
+            plist = [
+                {
+                    "name": p.get("name"),
+                    "vendor": p.get("vendor"),
+                    "product": p.get("product"),
+                    "deadzone_left": p.get("deadzone_left", 0.05),
+                    "deadzone_right": p.get("deadzone_right", 0.05),
+                    "rumble_enabled": p.get("rumble_enabled", True),
+                    "center_offset": p.get("center_offset", {}),
+                }
+                for p in profiles.values()
+            ]
+            self._send_json(200, plist)
+            return
 
-        else:
-            self.send_response(404)
-            self.end_headers()
+        if url.path == "/api/system/diagnose":
+            self._send_json(200, diagnose_system())
+            return
+
+        if url.path == "/api/export_pack":
+            try:
+                zip_bytes = _build_full_export_zip()
+                self._send_bytes(
+                    200,
+                    "application/zip",
+                    zip_bytes,
+                    {"Content-Disposition": 'attachment; filename="resiticks_amigos_pack.zip"'},
+                )
+            except Exception as exc:
+                self._send_json(500, {"error": f"No se pudo generar ZIP: {exc}"})
+            return
+
+        if url.path == "/api/calibrate/web/poll":
+            self._send_json(200, cal_session.poll())
+            return
+
+        self._send_json(404, {"error": "Endpoint no encontrado"})
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        try:
+            body = self._read_json_body()
+        except Exception as exc:
+            self._send_json(400, {"error": f"JSON inválido: {exc}"})
+            return
+
+        if url.path == "/api/bridge/toggle":
+            with state.lock:
+                state.bridge_enabled = not state.bridge_enabled
+                enabled = state.bridge_enabled
+                pins = dict(state.slot_pins)
+            save_config({"bridge_enabled": enabled, "slot_pins": pins})
+            state.supervisor_wakeup.set()
+            self._send_json(200, {"bridge_enabled": enabled})
+            return
+
+        if url.path == "/api/slots/swap":
+            from_slot = int(body.get("from_slot", 0))
+            to_slot = int(body.get("to_slot", 0))
+            if not (1 <= from_slot <= MAX_SLOTS and 1 <= to_slot <= MAX_SLOTS):
+                self._send_json(400, {"error": "Número de slot inválido"})
+                return
+            to_restart = []
+            with state.lock:
+                src_w = next((w for w in state.workers.values() if w.player_num == from_slot), None)
+                dst_w = next((w for w in state.workers.values() if w.player_num == to_slot), None)
+                if src_w:
+                    state.slot_overrides[src_w.identifier] = to_slot
+                    to_restart.append(state.workers.pop(src_w.identifier))
+                if dst_w:
+                    state.slot_overrides[dst_w.identifier] = from_slot
+                    to_restart.append(state.workers.pop(dst_w.identifier))
+            for w in to_restart:
+                w.stop(wait=True)
+            state.supervisor_wakeup.set()
+            self._send_json(200, {"swapped": [from_slot, to_slot]})
+            return
+
+        if url.path == "/api/slots/pin":
+            slot = int(body.get("slot", 0))
+            pin_key = str(body.get("pin_key", "")).strip()
+            if not (1 <= slot <= MAX_SLOTS) or not pin_key:
+                self._send_json(400, {"error": "Slot o pin_key inválido"})
+                return
+            with state.lock:
+                state.slot_pins[pin_key] = slot
+                cfg = {"bridge_enabled": state.bridge_enabled, "slot_pins": dict(state.slot_pins)}
+            save_config(cfg)
+            self._send_json(200, {"pinned": pin_key, "slot": slot})
+            return
+
+        if url.path == "/api/profile/tune":
+            vendor = str(body.get("vendor", "")).lower().zfill(4)
+            product = str(body.get("product", "")).lower().zfill(4)
+            profiles = load_profiles()
+            prof = profiles.get(f"{vendor}:{product}")
+            if not prof:
+                self._send_json(404, {"error": "Perfil no encontrado"})
+                return
+            if "deadzone_left" in body:
+                prof["deadzone_left"] = max(0.01, min(0.45, float(body["deadzone_left"])))
+            if "deadzone_right" in body:
+                prof["deadzone_right"] = max(0.01, min(0.45, float(body["deadzone_right"])))
+            if "rumble_enabled" in body:
+                prof["rumble_enabled"] = bool(body["rumble_enabled"])
+            if "center_offset" in body and isinstance(body["center_offset"], dict):
+                prof["center_offset"] = body["center_offset"]
+            save_profile(prof)
+            with state.lock:
+                state.profile_revision += 1
+            state.supervisor_wakeup.set()
+            self._send_json(200, {"ok": True})
+            return
+
+        if url.path == "/api/profile/center_zero":
+            slot = int(body.get("slot", 0))
+            with state.lock:
+                slot_item = state.active_slots.get(slot)
+                inp = copy.deepcopy(state.live_inputs.get(slot, {}))
+            if not slot_item:
+                self._send_json(404, {"error": "Slot vacío"})
+                return
+            profiles = load_profiles()
+            key = f"{slot_item['vendor']}:{slot_item['product']}"
+            prof = profiles.get(key)
+            if not prof:
+                self._send_json(404, {"error": "Perfil no encontrado"})
+                return
+            prof["center_offset"] = {
+                "lx": round(float(inp.get("raw_lx", 0.0)), 3),
+                "ly": round(float(inp.get("raw_ly", 0.0)), 3),
+                "rx": round(float(inp.get("raw_rx", 0.0)), 3),
+                "ry": round(float(inp.get("raw_ry", 0.0)), 3),
+            }
+            save_profile(prof)
+            with state.lock:
+                state.profile_revision += 1
+            state.supervisor_wakeup.set()
+            self._send_json(200, {"ok": True, "center_offset": prof["center_offset"]})
+            return
+
+        if url.path == "/api/profiles/rename":
+            vendor = str(body.get("vendor", "")).lower().zfill(4)
+            product = str(body.get("product", "")).lower().zfill(4)
+            new_name = str(body.get("name", "")).strip()
+            if not new_name:
+                self._send_json(400, {"error": "Nombre vacío"})
+                return
+            profiles = load_profiles()
+            prof = profiles.get(f"{vendor}:{product}")
+            if not prof:
+                self._send_json(404, {"error": "Perfil no encontrado"})
+                return
+            prof["name"] = new_name
+            save_profile(prof)
+            with state.lock:
+                state.profile_revision += 1
+            state.supervisor_wakeup.set()
+            self._send_json(200, {"ok": True})
+            return
+
+        if url.path == "/api/profiles/delete":
+            vendor = str(body.get("vendor", ""))
+            product = str(body.get("product", ""))
+            deleted = delete_profile(vendor, product)
+            with state.lock:
+                state.profile_revision += 1
+            state.supervisor_wakeup.set()
+            self._send_json(200 if deleted else 404, {"deleted": deleted})
+            return
+
+        if url.path == "/api/profiles/import":
+            try:
+                norm = normalize_profile_data(body)
+                save_profile(norm)
+                with state.lock:
+                    state.profile_revision += 1
+                state.supervisor_wakeup.set()
+                self._send_json(200, {"ok": True, "name": norm["name"]})
+            except Exception as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        if url.path == "/api/update/github":
+            try:
+                res = _update_from_github()
+                state.supervisor_wakeup.set()
+                self._send_json(200, res)
+            except Exception as exc:
+                self._send_json(500, {"error": f"Fallo al actualizar desde GitHub: {exc}"})
+            return
+
+        if url.path == "/api/calibrate/launch":
+            with state.lock:
+                if state.cal_launch_proc and state.cal_launch_proc.poll() is None:
+                    self._send_json(200, {"status": "already_running"})
+                    return
+            term = detect_terminal_cmd()
+            if not term:
+                self._send_json(400, {"error": "No se detectó terminal gráfica compatible; usá el Calibrador Web."})
+                return
+            term_bin, flag = term
+            cal_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "calibrate.py")
+            proc = subprocess.Popen([term_bin, flag, "python3", cal_path])
+            with state.lock:
+                state.cal_launch_proc = proc
+            self._send_json(200, {"status": "launched", "terminal": os.path.basename(term_bin)})
+            return
+
+        if url.path == "/api/calibrate/pause":
+            dev_path = str(body.get("dev_path", "")).strip()
+            if dev_path:
+                with state.lock:
+                    state.paused_devices.add(dev_path)
+                state.supervisor_wakeup.set()
+                time.sleep(0.2)
+            self._send_json(200, {"paused": dev_path})
+            return
+
+        if url.path == "/api/calibrate/resume":
+            dev_path = str(body.get("dev_path", "")).strip()
+            with state.lock:
+                state.paused_devices.discard(dev_path)
+            state.supervisor_wakeup.set()
+            self._send_json(200, {"resumed": dev_path})
+            return
+
+        if url.path == "/api/calibrate/web/start":
+            try:
+                snap = cal_session.start(str(body.get("dev_path", "")))
+                self._send_json(200, snap)
+            except Exception as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        if url.path == "/api/calibrate/web/skip":
+            self._send_json(200, cal_session.skip_step())
+            return
+
+        if url.path == "/api/calibrate/web/prev":
+            self._send_json(200, cal_session.prev_step())
+            return
+
+        if url.path == "/api/calibrate/web/accept_warning":
+            self._send_json(200, cal_session.accept_warning())
+            return
+
+        if url.path == "/api/calibrate/web/save":
+            try:
+                res = cal_session.save(body.get("name"))
+                state.supervisor_wakeup.set()
+                self._send_json(200, res)
+            except Exception as exc:
+                self._send_json(400, {"error": str(exc)})
+            return
+
+        if url.path == "/api/calibrate/web/cancel":
+            cal_session.cancel()
+            self._send_json(200, {"cancelled": True})
+            return
+
+        self._send_json(404, {"error": "Endpoint no encontrado"})
+
 
 def main():
+    """Boot device supervisor, start ThreadingHTTPServer cleanly, and open browser."""
+    parser = argparse.ArgumentParser(description="Resiticks — Hub Universal de Joysticks")
+    parser.add_argument("--port", type=int, default=8765, help="Puerto HTTP local (default: 8765)")
+    parser.add_argument("--no-browser", action="store_true", help="No abrir ventana de navegador al iniciar")
+    args = parser.parse_args()
+
+    url = f"http://127.0.0.1:{args.port}"
     print("=" * 65)
     print(" 🎮 Resiticks — Hub de Joysticks (8 Jugadores)")
+    print(f" 📂 Perfiles: {resolve_profiles_dir()}")
     print("=" * 65)
+
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), ResiticksHTTPHandler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            print(f"ℹ️  Resiticks ya está corriendo en {url}. Abriendo panel...")
+            if not args.no_browser:
+                launch_browser_url(url)
+            sys.exit(0)
+        raise
 
     sup_thread = threading.Thread(target=device_supervisor, daemon=True)
     sup_thread.start()
 
-    server = HTTPServer(("127.0.0.1", 8765), ResiticksHTTPHandler)
-    print(" 🚀 Servidor Resiticks corriendo en: http://127.0.0.1:8765")
+    print(f" 🚀 Servidor Resiticks corriendo en: {url}")
+    if not args.no_browser:
+        browser = launch_browser_url(url)
+        if not browser:
+            print(f"Abrí {url} en tu navegador.")
 
-    try:
-        subprocess.Popen(["chromium", "--app=http://127.0.0.1:8765", "--window-size=1040,780"])
-    except Exception as e:
-        print(f"Abrí http://127.0.0.1:8765: {e}")
+    def _handle_sig(*_):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _handle_sig)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n🛑 Cerrando Resiticks...")
-        for w in state.workers.values():
-            w.stop()
-        print("✅ Mandos liberados.")
+    finally:
+        cal_session.cancel()
+        state.shutdown_event.set()
+        state.supervisor_wakeup.set()
+        with state.lock:
+            workers = list(state.workers.values())
+            state.workers.clear()
+        for w in workers:
+            w.stop(wait=True)
+        server.server_close()
+        print("✅ Mandos liberados correctamente.")
+
 
 if __name__ == "__main__":
     main()

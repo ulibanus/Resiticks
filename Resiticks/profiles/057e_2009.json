@@ -90,7 +90,7 @@
     },
     "right_up": {
       "type": "axis",
-      "code": 3,
+      "code": 4,
       "direction": -1,
       "value": -17147
     },
@@ -109,8 +109,8 @@
     "right_right": {
       "type": "axis",
       "code": 3,
-      "direction": -1,
-      "value": -16379
+      "direction": 1,
+      "value": 16379
     },
     "thumbr": {
       "type": "btn",

@@ -10,42 +10,39 @@ total para Steam, PES 6 y juegos de PC.
 📁 ESTRUCTURA DEL PAQUETE
 --------------------------------------------------------------------------------
 ├── 1_Linux/          -> Versión completa nativa para Linux (Steam/Proton/PES)
-│   ├── iniciar_resiticks.sh      (Abre la interfaz gráfica con diagnóstico)
-│   ├── calibrar_nuevo_mando.sh   (Calibrador rápido por consola de PES)
-│   ├── app.py                    (Código fuente interfaz gráfica 8 slots)
-│   ├── calibrate.py              (Calibrador oficial paso a paso)
-│   ├── bridge.py                 (Motor de inyección XInput)
-│   └── virtual_xbox.py           (Controlador nativo /dev/uinput)
+│   ├── iniciar_resiticks.sh        (Abre el panel web 8 slots + puente Xbox)
+│   ├── calibrar_nuevo_mando.sh     (Calibrador alternativo por consola)
+│   ├── instalar_sistema_linux.sh   (Configura regla udev /dev/uinput + ícono)
+│   ├── app.py                      (Motor principal + servidor HTTP + API web)
+│   ├── web_ui.py                   (Panel interactivo + calibrador web PES)
+│   ├── evdev_utils.py              (Detección, perfiles y diagnóstico USB)
+│   ├── calibration_core.py         (Asistente PES + alerta luz ANALOG)
+│   ├── calibrate.py                (Calibrador consola PES)
+│   ├── sniffer.py                  (Depurador de eventos evdev en vivo)
+│   └── virtual_xbox.py             (Controlador nativo /dev/uinput + vibración)
 │
 ├── 2_Windows/        -> Versión y guía de compatibilidad para Windows
-│   ├── GUIA_WINDOWS.txt          (Diferencias, x360ce, ViGEmBus e HidHide)
-│   ├── instalar_requisitos.bat   (Instala dependencias en Windows)
-│   └── resiticks_windows.py      (Motor XInput con vgamepad)
+│   ├── GUIA_WINDOWS.txt            (Diferencias, x360ce, ViGEmBus e HidHide)
+│   ├── instalar_requisitos_windows.bat
+│   └── resiticks_windows.py        (Motor ViGEmBus multi-perfil + panel web)
 │
-└── profiles/         -> La biblioteca con los 15 joysticks ya calibrados
-    ├── 0079_0006.json            (🎮 Joystick Aitor - Microntek)
-    ├── 0e8f_0008.json            (🎮 JOYSTICK GMX Julian G)
-    ├── 20d6_576d.json            (🎮 Joystick Ramiro-Chino - BDA OPP)
-    ├── 057e_2009.json            (🎮 Redragon Fausto - Switch Pro Mode)
-    ├── 045e_028e.json            (🎮 Redragon Mate - Xbox Mode)
-    ├── 054c_0268.json            (🎮 Joystick camuflado Daco - PS3)
-    ├── 054c_05c4.json            (🎮 Sony DualShock 4 V1)
-    ├── 054c_09cc.json            (🎮 Sony DualShock 4 V2)
-    └── 045e_*.json               (🎮 Xbox 360, Xbox One, Series X|S)
+├── profiles/         -> Biblioteca con 15 mandos ya calibrados (.json)
+├── actualizar.sh     -> Actualizador Linux 1-clic desde GitHub
+└── actualizar.bat    -> Actualizador Windows 1-clic desde GitHub
 
 --------------------------------------------------------------------------------
-🐧 DIFERENCIAS: LINUX vs. WINDOWS
+🐧 PRIMER USO EN LINUX
 --------------------------------------------------------------------------------
-• EN LINUX:
-  El kernel de Linux tiene soporte nativo para crear mandos virtuales ("/dev/uinput")
-  y bloquear mandos genéricos para que no haya doble input ("EVIOCGRAB").
-  No necesita drivers externos. Simplemente corrés "./iniciar_resiticks.sh".
-
-• EN WINDOWS:
-  Windows necesita el driver abierto "ViGEmBus" para emular Xbox 360, y la utilidad
-  "HidHide" de Nefarius para ocultar el mando físico y evitar que el juego reciba
-  dos señales al mismo tiempo (doble input).
-  (Ver detalles paso a paso dentro de la carpeta "2_Windows/GUIA_WINDOWS.txt").
+1. Si es tu primera vez en Linux, ejecutá una vez en terminal dentro de 1_Linux:
+      ./instalar_sistema_linux.sh
+2. Para jugar, conectá los joysticks (con el botón ANALOG encendido en genéricos)
+   y ejecutá:
+      ./iniciar_resiticks.sh   (o usá el ícono "Resiticks" del menú)
+3. Desde la propia web (http://127.0.0.1:8765) podés:
+   • Calibrar un mando nuevo sin cerrar la partida de tus amigos
+   • Intercambiar jugadores (P1 <-> P2) o fijar slots por puerto USB
+   • Regular Zona Muerta (Anti-Drift) y calibrar centro cero
+   • Revisar diagnóstico USB/udev y actualizar perfiles desde GitHub
 
 --------------------------------------------------------------------------------
 ⚽ REGLA DE ORO EN PES 6 SETTINGS (WINDOWS Y LINUX/PROTON)
@@ -56,20 +53,9 @@ Tanto en Windows como en Linux, asigná cada jugador así:
   • Player 2: Elegir "Controller (XBOX 360 For Windows) - 2"
   • Player 3: Elegir "Controller (XBOX 360 For Windows) - 3"
   • Player 4: Elegir "Controller (XBOX 360 For Windows) - 4"
-  (Hasta Player 8 si juegan 8 amigos).
+  (Hasta Player 8 en Linux si juegan 8 amigos).
 
-⚠️ Si te aparecen nombres como "Microntek" o "Gasia", IGNORALOS.
+⚠️ Si aparecen nombres como "Microntek" o "Gasia", IGNORALOS.
 Eligiendo los que dicen "Controller (XBOX 360...)" tenés garantizadas las 4
 direcciones de ambas palancas, los amagues y los botones correctos.
-
---------------------------------------------------------------------------------
-🎯 CÓMO CALIBRAR UN JOYSTICK NUEVO POR CONSOLA
---------------------------------------------------------------------------------
-En Linux:
-1. Conectá el joystick nuevo.
-2. Abrí una terminal en la carpeta "1_Linux" y ejecutá:
-      ./calibrar_nuevo_mando.sh
-3. Elegí el número del joystick y seguí el orden de PES Settings.
-4. Escribí el nombre de tu amigo (ej: "Joystick de Lucas") y dale ENTER.
-¡Queda guardado en "profiles/" para siempre!
 ================================================================================

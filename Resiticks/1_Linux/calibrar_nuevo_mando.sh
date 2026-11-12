@@ -1,3 +1,3 @@
 #!/bin/bash
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-python3 "$DIR/calibrate.py"
+exec python3 "$DIR/calibrate.py" "$@"

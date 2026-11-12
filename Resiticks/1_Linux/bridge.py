@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║  ⚠️  DEPRECADO — Este archivo ya NO se usa.                     ║
+# ║  El motor principal ahora vive en app.py (con web UI,           ║
+# ║  8 slots, EVIOCGRAB con retry y supervisor con locks).          ║
+# ║                                                                  ║
+# ║  Se conserva temporalmente como referencia.                      ║
+# ║  Para ejecutar Resiticks usá:  python3 app.py                   ║
+# ╚══════════════════════════════════════════════════════════════════╝
 import os
 import sys
 import glob
@@ -17,11 +25,13 @@ from virtual_xbox import (
     EV_KEY, EV_ABS
 )
 
+from evdev_utils import resolve_profiles_dir
+
 EVENT_FORMAT = "qqHHi"
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 EVIOCGRAB = 0x40044590
 
-PROFILES_DIR = os.path.expanduser("~/joybridge/profiles")
+PROFILES_DIR = resolve_profiles_dir()
 
 def load_profiles():
     profiles = {}
@@ -279,6 +289,15 @@ def print_status_banner(profiles):
     print(" Presioná [Ctrl + C] para salir.\n" + "-" * 68)
 
 def main():
+    print("=" * 65)
+    print(" ⚠️  bridge.py está DEPRECADO.")
+    print(" 👉 Usá en su lugar:  python3 app.py")
+    print("=" * 65)
+    ans = input("\n¿Querés continuar de todas formas? (s/N): ").strip().lower()
+    if ans != "s":
+        print("Saliendo. Ejecutá: python3 app.py")
+        sys.exit(0)
+
     profiles = load_profiles()
     print_status_banner(profiles)
 
